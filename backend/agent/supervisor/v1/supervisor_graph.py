@@ -11,7 +11,7 @@ from langchain_core.messages import BaseMessage, AIMessage, HumanMessage, System
 from langgraph.graph.message import add_messages
 from langchain_openai import ChatOpenAI  
 from langchain.agents import create_agent
-from .mcp_client import get_mcp_tools
+from ...mcp_client import get_mcp_tools
 from schemas.error import ToolError, OrchestrationError, CapstoneError, ErrorLayer
 
 

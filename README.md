@@ -1,16 +1,9 @@
-# b20 · Supervisor 최종 (Part B)
+# refactor/v2 (참고용 — 학습 범위 외)
 
-이 태그는 **Part B(Supervisor 고도화)의 최종 완성본**이자 과정 전체의 마지막 참조입니다.
-`b10` 상태에서 4가지 개선을 적용합니다.
+이 브랜치는 Part A+B 완성 코드를 **product-grade로 리팩터링한 참고본**입니다.
+학생 과정(`main`의 a10~b20 태그)에는 포함되지 않습니다.
 
-## 이 단계에서 완성되어야 할 것
-- `backend/agent/supervisor_graph.py` — 4가지 개선 반영
-  1. Query Routing — 단순/복잡 분기
-  2. Validator sub-agent — 최종 응답 품질 검증
-  3. Conditional Routing — Supervisor 내부 분기
-  4. Dynamic Planning — replan
-- `backend/schemas/stream.py`, `streaming/event_converter.py` — routing/validation/replan 이벤트
-- 프론트엔드: `ValidationView.tsx`, `ReplanView.tsx`(신규) + `page.tsx`/`types.ts`/`ChatMessage` 확장
-
-## 이전
-이전: `b10-supervisor-start`
+## main 대비 차이
+- `backend/agent/supervisor_graph.py`(flat) → `backend/agent/supervisor/v1/`(legacy) + `v2/`(modular) 패키지로 분리
+- `backend/config.py` — LLM 모델, MAX_REPLAN_ROUNDS 등 설정 통합
+- `backend/main.py` — 환경변수 `SUPERVISOR_VERSION`(v1/v2)으로 supervisor 구현 전환

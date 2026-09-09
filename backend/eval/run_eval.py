@@ -12,7 +12,7 @@ load_dotenv(BACKEND_DIR.parent / ".env")
 import asyncio
 import uuid
 from langsmith import aevaluate
-from agent.supervisor_graph import build_supervisor_graph
+from agent.supervisor.v1.supervisor_graph import build_supervisor_graph
 from eval.evaluators import has_expected_topics, response_quality_judge
 
 
