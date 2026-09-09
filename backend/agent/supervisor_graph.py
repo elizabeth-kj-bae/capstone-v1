@@ -1,6 +1,7 @@
 """
 Supervisor 패턴 기반 Multi-agent Graph.
 """
+import asyncio
 from typing import TypedDict, Annotated, Literal
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
@@ -31,13 +32,26 @@ class SupervisorState(TypedDict):
 async def build_supervisor_graph():
     """
     Supervisor 기반 multi-agent graph 생성.
+
+    Cost/Latency 최적화:
+    - Planning: 빠르고 저렴한 모델 (단순 분류/구조화 task)
+    - Research/Writing: 고품질 모델 (정보 추출 + 응답 생성 품질 중요)
+    - Research task 병렬 실행 (fan-out / fan-in)
     """
-    llm = ChatOpenAI(model="gpt-4o", temperature=0)
+    # 단계별 모델 분리
+    fast_llm = ChatOpenAI(
+        model="gpt-4o-mini",  # 빠르고 저렴
+        temperature=0,
+    )
+    quality_llm = ChatOpenAI(
+        model="gpt-4o",  # 품질 우선
+        temperature=0,
+    )
     
     # Sub-agent 1: Research Agent (MCP tools 사용)
     mcp_tools = await get_mcp_tools()
     research_agent = create_agent(
-        model=llm,
+        model=quality_llm,
         tools=mcp_tools,
         system_prompt=(
             "당신은 Research Agent입니다. "
@@ -48,7 +62,7 @@ async def build_supervisor_graph():
     
     # Sub-agent 2: Writing Agent (LLM만)
     writing_agent = create_agent(
-        model=llm,
+        model=quality_llm,
         tools=[],
         system_prompt=(
             "당신은 Writing Agent입니다. "
@@ -57,7 +71,7 @@ async def build_supervisor_graph():
         ),
     )
     
-    # Supervisor의 Planning 함수
+    # Supervisor의 Planning 함수 (fast_llm 사용)
     async def planning_node(state: SupervisorState) -> dict:
         """
         Supervisor: 사용자 요청을 받아 plan을 수립하고 task로 분해.
@@ -82,7 +96,7 @@ async def build_supervisor_graph():
   ]
 }}
 """
-        response = await llm.ainvoke([
+        response = await fast_llm.ainvoke([
             SystemMessage(content="You are a planning supervisor."),
             HumanMessage(content=planning_prompt),
         ])
@@ -111,95 +125,134 @@ async def build_supervisor_graph():
             "current_task_index": 0,
         }
     
-    # Task 실행 함수 -- Update 
-    async def execute_task_node(state: SupervisorState) -> dict:
+    # Research task 병렬 실행 (fan-out / fan-in)
+    async def execute_all_research_tasks_node(state: SupervisorState) -> dict:
         """
-        현재 task를 담당 sub-agent에게 위임하여 실행.
+        Research task들을 병렬 실행.
 
-        Graceful Degradation 적용 : 
-        - Tool 실패 시 task를 'failed' 상태로 표시 
-        - 다음 task로 계속 진행 (전체 실패 X)
-        - 최종 응답 생성 시 failed task 정보를 Writing agent에게 전달 
+        Cost/Latency 최적화:
+        - 기존 순차 실행 → 병렬 실행
+        - Research task들은 서로 독립적이므로 병렬 가능
+        - Writing task는 모든 research 결과 필요하므로 별도 실행
+        """
+        tasks = state["tasks"].copy()
+        
+        # Research task들만 추출 (writing은 별도)
+        research_indices = [
+            i for i, t in enumerate(tasks) if t["agent"] == "research"
+        ]
+        
+        # 각 research task를 in_progress로 표시
+        for i in research_indices:
+            tasks[i] = {**tasks[i], "status": "in_progress"}
+        
+        # 병렬 실행
+        async def run_single_task(idx: int) -> tuple[int, dict]:
+            """단일 task 실행. 결과를 (index, updated_task) 형태로 반환."""
+            task = tasks[idx]
+            try:
+                result = await research_agent.ainvoke(
+                    {"messages": [HumanMessage(content=task["description"])]},
+                )
+                result_text = result["messages"][-1].content
+                return idx, {
+                    **task,
+                    "status": "completed",
+                    "result": result_text,
+                }
+            except ToolError as e:
+                return idx, {
+                    **task,
+                    "status": "failed",
+                    "result": None,
+                    "error_code": e.error.code,
+                    "error_message": e.error.user_message or "도구 사용 중 오류 발생",
+                }
+            except Exception as e:
+                return idx, {
+                    **task,
+                    "status": "failed",
+                    "result": None,
+                    "error_code": "UNEXPECTED_ERROR",
+                    "error_message": "예상치 못한 오류가 발생했습니다",
+                }
+        
+        # asyncio.gather로 병렬 실행
+        results = await asyncio.gather(*[
+            run_single_task(idx) for idx in research_indices
+        ])
+        
+        # 결과 반영
+        for idx, updated_task in results:
+            tasks[idx] = updated_task
+        
+        # current_task_index를 모든 research task가 끝난 다음으로 점프
+        new_index = max(research_indices) + 1 if research_indices else 0
+        
+        return {
+            "tasks": tasks,
+            "current_task_index": new_index,
+        }
+    
+    async def execute_writing_task_node(state: SupervisorState) -> dict:
+        """
+        Writing task 실행 (모든 research 결과를 context로).
+
+        기존 execute_task_node의 writing 처리 로직과 동일.
         """
         idx = state["current_task_index"]
-        task = state["tasks"][idx]
         
-        # task 상태를 in_progress로 변경
+        if idx >= len(state["tasks"]):
+            # Writing task가 없는 경우
+            return {"current_task_index": idx}
+        
+        task = state["tasks"][idx]
         tasks = state["tasks"].copy()
         tasks[idx] = {**task, "status": "in_progress"}
         
-        # 적절한 sub-agent 선택
-        if task["agent"] == "research":
-            agent = research_agent
-        elif task["agent"] == "writing":
-            previous_results = "\n\n".join([
-                f"- {t['description']}\n  결과: {t['result']}"
-                for t in tasks if t.get("result") is not None and t.get("status") == "completed"
+        # Research 결과 통합
+        previous_results = "\n\n".join([
+            f"- {t['description']}\n  결과: {t['result']}"
+            for t in tasks if t.get("result") is not None and t.get("status") == "completed"
+        ])
+        failed_tasks = [t for t in tasks if t.get("status") == "failed"]
+        failed_context = ""
+        if failed_tasks:
+            failed_context = "\n\n다음 task는 실패로 정보 수집 불가:\n" + "\n".join([
+                f"- {t['description']}: {t.get('error_message', '알 수 없는 사유')}"
+                for t in failed_tasks
             ])
-            failed_tasks = [t for t in tasks if t.get("status") == "failed"]
-            failed_context = ""
-            if failed_tasks:
-                failed_context = "\n\n다음 task는 실패로 정보 수집 불가:\n" + "\n".join([
-                    f"- {t['description']}: {t.get('error_message', '알 수 없는 사유')}"
-                    for t in failed_tasks
-                ])
-            task_context = (
-                f"이전 task의 수집 결과:\n{previous_results}\n{failed_context}\n\n"
-                f"위 정보(완성 정보 + 실패 정보)를 바탕으로 사용자에게 가치 있는 답변을 제공: "
-                f"{task['description']}"
-            )
-            agent = writing_agent
+        task_context = (
+            f"이전 task의 수집 결과:\n{previous_results}\n{failed_context}\n\n"
+            f"위 정보(완성 정보 + 실패 정보)를 바탕으로: {task['description']}"
+        )
         
-        # Sub-agent 호출 — Graceful Degradation 적용
-        agent_input_message = task["description"] if task["agent"] == "research" else task_context
-
         try:
-            result = await agent.ainvoke(
-                {"messages": [HumanMessage(content=agent_input_message)]},
+            result = await writing_agent.ainvoke(
+                {"messages": [HumanMessage(content=task_context)]},
             )
-            # 성공 — task 완료 처리
             result_text = result["messages"][-1].content
             tasks[idx] = {**tasks[idx], "status": "completed", "result": result_text}
-        
-        except ToolError as e:
-            # Tool 실패 — 본 task만 실패로 표시, 다음 task로 계속 진행
-            tasks[idx] = {
-                **tasks[idx],
-                "status": "failed",
-                "result": None,
-                "error_code": e.error.code,
-                "error_message": e.error.user_message or "도구 사용 중 오류 발생",
-            }
-            # Error 처리 핵심: 실패해도 전체 graph는 계속 진행
-        
         except Exception as e:
-            # 예상치 못한 error — orchestration error로 변환
             tasks[idx] = {
                 **tasks[idx],
                 "status": "failed",
                 "result": None,
-                "error_code": "UNEXPECTED_ERROR",
-                "error_message": "예상치 못한 오류가 발생했습니다",
+                "error_message": "응답 생성 중 오류가 발생했습니다",
             }
-    
+        
         return {
             "tasks": tasks,
             "current_task_index": idx + 1,
         }
     
-    # 다음 단계 결정
-    def should_continue(state: SupervisorState) -> Literal["execute", "finalize"]:
-        if state["current_task_index"] < len(state["tasks"]):
-            return "execute"
-        return "finalize"
-    
-    # 최종 응답 생성 -- Update
+    # 최종 응답 생성
     async def finalize_node(state: SupervisorState) -> dict:
         """
         모든 task 완료 후 최종 응답을 사용자에게 반환.
 
         Graceful Degradation:
-        - Writing task가 성공했다고 그 결과를 반환
+        - Writing task가 성공했다면 그 결과를 반환
         - Writing task도 실패했다면 partial result로 fallback 응답 생성 
         """
         last_task = state["tasks"][-1]
@@ -209,7 +262,6 @@ async def build_supervisor_graph():
             final_response = last_task["result"]
         else:
             # Fallback: writing task도 실패한 경우
-            # 수집된 partial result만으로 단순 응답 생성
             partial_results = [
                 f"- {t['description']}: {t['result']}"
                 for t in state["tasks"]
@@ -233,19 +285,17 @@ async def build_supervisor_graph():
             "messages": [AIMessage(content=final_response)],
         }
     
-    # Graph 구성
+    # Graph 구성 (병렬 실행 적용)
     workflow = StateGraph(SupervisorState)
     workflow.add_node("planning", planning_node)
-    workflow.add_node("execute", execute_task_node)
+    workflow.add_node("execute_research", execute_all_research_tasks_node)  # 병렬 처리 노드
+    workflow.add_node("execute_writing", execute_writing_task_node)
     workflow.add_node("finalize", finalize_node)
     
     workflow.add_edge(START, "planning")
-    workflow.add_edge("planning", "execute")
-    workflow.add_conditional_edges(
-        "execute",
-        should_continue,
-        {"execute": "execute", "finalize": "finalize"},
-    )
+    workflow.add_edge("planning", "execute_research")
+    workflow.add_edge("execute_research", "execute_writing")
+    workflow.add_edge("execute_writing", "finalize")
     workflow.add_edge("finalize", END)
     
     # Checkpointer (in-memory, Day 1과 동일)
