@@ -3,11 +3,15 @@ LangGraph agent 정의.
 
 capstone의 결정 1, 3의 구현:
 - 결정 1: Agent가 tool로 retrieval 호출 → ReAct agent + MCP tools
-- 결정 3: In-memory state → MemorySaver checkpointer
+- 결정 3: In-memory state → MemorySaver checkpointer 
+
+[Update] Checkpointer 
+- Single agent도 checkpointer를 외부에서 주입받도록 함 
 """
 from langchain.agents import create_agent
 from langgraph.checkpoint.memory import MemorySaver
-from langchain_openai import ChatOpenAI  # 또는 langchain_anthropic
+from langgraph.checkpoint.base import BaseCheckpointSaver
+from langchain_openai import ChatOpenAI  
 from .mcp_client import get_mcp_tools
 
 
@@ -27,22 +31,22 @@ SYSTEM_PROMPT = """\
 """
 
 
-async def build_agent():
+async def build_agent(checkpointer: BaseCheckpointSaver):
     """
     LangGraph ReAct agent 생성.
-
+    
     Returns:
         Compiled LangGraph (checkpointer 포함)
     """
     # MCP server에서 Tool 로드
     tools = await get_mcp_tools()
-
+    
     # LLM 설정
     llm = ChatOpenAI(model="gpt-4o", temperature=0)
-
-    # Checkpointer: in-memory
-    checkpointer = MemorySaver()
-
+    
+    # Checkpointer: in-memory 
+    # checkpointer = MemorySaver()
+    
     # ReAct agent 생성
     agent = create_agent(
         model=llm,
@@ -50,5 +54,5 @@ async def build_agent():
         system_prompt=SYSTEM_PROMPT,
         checkpointer=checkpointer,
     )
-
+    
     return agent
