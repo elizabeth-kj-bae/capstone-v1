@@ -102,3 +102,53 @@ class ErrorEvent(BaseModel):
     recoverable: bool = Field(
         description="복구 가능한 error인지. true면 frontend가 부분 응답을 유지"
     )
+
+
+class RoutingDecidedEvent(BaseModel):
+    """
+    Supervisor의 routing 결정을 frontend에 알림.
+    
+    Frontend는 이 event를 받아:
+    - simple: 단순 응답 UI 모드 (Plan/Task 카드 표시 안 함)
+    - complex: 기존 multi-agent UI 모드 (Plan/Task 카드 표시)
+    """
+    type: Literal["routing_decided"] = "routing_decided"
+    route: Literal["simple", "complex"]
+    reasoning: str = Field(description="결정 근거")
+
+
+class ValidationStartedEvent(BaseModel):
+    """Validator가 검증 시작."""
+    type: Literal["validation_started"] = "validation_started"
+    attempt: int = Field(description="현재 Writing 시도 횟수 (1=첫 시도, 2=재시도)")
+
+
+class ValidationCompletedEvent(BaseModel):
+    """Validator의 검증 완료."""
+    type: Literal["validation_completed"] = "validation_completed"
+    is_acceptable: bool
+    score: float
+    reasoning: str
+    will_retry: bool = Field(description="재시도 예정 여부")
+
+
+class WritingRetryEvent(BaseModel):
+    """Writing 재시도 시작."""
+    type: Literal["writing_retry"] = "writing_retry"
+    attempt: int = Field(description="재시도 회차 (2)")
+    feedback: str = Field(description="이전 Validator의 feedback")
+
+
+class ReplanDecidedEvent(BaseModel):
+    """
+    Supervisor의 재계획 결정.
+    
+    Dynamic Planning:
+    - is_sufficient: True면 정상 진행, False면 추가 task 실행
+    - added_task_count: 추가된 task 수 (0이면 추가 없음)
+    """
+    type: Literal["replan_decided"] = "replan_decided"
+    is_sufficient: bool
+    reasoning: str
+    added_task_count: int
+

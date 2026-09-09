@@ -20,7 +20,13 @@ from schemas.stream import (
     TaskStartedEvent,
     TaskCompletedEvent,
     SubAgentTokenEvent,
+    SubAgentToolCallEvent,
     ErrorEvent,
+    RoutingDecidedEvent,
+    ValidationStartedEvent,
+    ValidationCompletedEvent,
+    WritingRetryEvent,
+    ReplanDecidedEvent,
 )
 
 
@@ -78,37 +84,110 @@ async def convert_supervisor_events(
 ):
     """
     Supervisor graph의 stream event를 본 capstone SSE event로 변환.
-
+    
     Multi-agent 시나리오의 event들을 frontend가 가시화할 수 있는 형태로 송출.
-    Graceful Degradation: stream 중 예외는 ErrorEvent로 전달.
+    (+) routing event 추가.
     """
-    current_task_id = None
-    previous_tasks = None
-
+    current_task_id = None  # 현재 활성 task
+    previous_tasks = None   # 이전 state의 tasks (변화 감지용)
+    last_validation_feedback = None  # 직전 validator가 생성한 재시도 feedback
+        
     try:
-        async for mode, data in supervisor_stream:
+        async for mode, data in supervisor_stream: 
 
             if mode == "updates":
+                # 어느 node가 업데이트되었는지 확인
                 for node_name, node_update in data.items():
+                    
+                    if node_name == "routing":
+                        if "route" in node_update:
+                            yield RoutingDecidedEvent(
+                                route=node_update["route"],
+                                reasoning=node_update.get("route_reasoning", ""),
+                            )
+                    
+                    elif node_name == "simple_response":
+                        if "messages" in node_update:
+                            last_msg = node_update["messages"][-1]
+                            if hasattr(last_msg, "content"):
+                                yield TokenEvent(content=last_msg.content)
 
-                    if node_name == "planning":
+                    elif node_name == "planning":
+                        # Planning 완료 → plan_created + task_list_created
+                        if "plan" in node_update:
+                            yield PlanCreatedEvent(plan=node_update["plan"])
+                        if "tasks" in node_update:
+                            yield TaskListCreatedEvent(tasks=node_update["tasks"])
+                            previous_tasks = node_update["tasks"]
+                        
+                    elif node_name == "replan_check":
+                        # Replan 평가 결과만 처리 (plan/tasks 갱신은 replan 노드에서)
+                        if "replan_decision" in node_update:
+                            decision = node_update["replan_decision"]
+                            yield ReplanDecidedEvent(
+                                is_sufficient=decision.get("is_sufficient", True),
+                                reasoning=decision.get("reasoning", ""),
+                                added_task_count=decision.get("added_task_count", 0),
+                            )
+
+                    elif node_name == "replan":
+                        # Plan 재수립 결과: 갱신된 plan + 추가 task + ReplanDecidedEvent 재발행.
+                        # ReplanDecidedEvent는 직전 replan_check의 카드를 update하는 용도
+                        # (같은 reasoning으로 발행 → frontend가 같은 카드로 인식하여 added_task_count만 갱신).
+                        if "replan_decision" in node_update:
+                            decision = node_update["replan_decision"]
+                            yield ReplanDecidedEvent(
+                                is_sufficient=False,
+                                reasoning=decision.get("reasoning", ""),
+                                added_task_count=decision.get("added_task_count", 0),
+                            )
                         if "plan" in node_update:
                             yield PlanCreatedEvent(plan=node_update["plan"])
                         if "tasks" in node_update:
                             yield TaskListCreatedEvent(tasks=node_update["tasks"])
                             previous_tasks = node_update["tasks"]
 
-                    elif node_name == "execute":
+                    elif node_name == "finalize":
+                        # 최종 응답 → 기존 token event로 흘려보냄 (단순화)
+                        if "messages" in node_update:
+                            last_msg = node_update["messages"][-1]
+                            if hasattr(last_msg, "content"):
+                                # 전체 응답을 한 번에 보냄 (단순화)
+                                yield TokenEvent(content=last_msg.content)
+
+                    elif node_name == "validator":
+                        # Validator 결과 처리 
+                        if "validation_result" in node_update:
+                            val = node_update["validation_result"]
+                            # 재시도 시 execute_writing 단계에서 사용하기 위해 보관
+                            last_validation_feedback = val.get("feedback")
+                            attempts = node_update.get("writing_attempts", 1)
+                            will_retry = (
+                                not val.get("is_acceptable", True) and
+                                attempts < 2
+                            )
+                            yield ValidationCompletedEvent(
+                                is_acceptable=val.get("is_acceptable", False),
+                                score=val.get("score", 0.0),
+                                reasoning=val.get("reasoning", ""),
+                                will_retry=will_retry,
+                            )
+
+                    elif node_name in ("execute_research", "execute_analysis", "execute_writing"):
+                        # 모든 execute_* 노드 공통: tasks status diff로 lifecycle 이벤트 발행.
+                        # agent 종류와 무관하게 동일 로직 적용 (research·analysis·writing 모두 처리).
                         if "tasks" in node_update:
                             new_tasks = node_update["tasks"]
                             for new_t, old_t in zip(new_tasks, previous_tasks or []):
-                                if new_t["status"] == "in_progress" and old_t["status"] == "pending":
+                                if (new_t["status"] == "in_progress"
+                                        and old_t["status"] == "pending"):
                                     yield TaskStartedEvent(
                                         task_id=new_t["id"],
                                         agent_name=new_t["agent"],
                                     )
                                     current_task_id = new_t["id"]
-                                elif new_t["status"] in ["completed", "failed"] and old_t["status"] != new_t["status"]:
+                                elif (new_t["status"] in ("completed", "failed")
+                                        and old_t["status"] != new_t["status"]):
                                     yield TaskCompletedEvent(
                                         task_id=new_t["id"],
                                         status=new_t["status"],
@@ -117,13 +196,17 @@ async def convert_supervisor_events(
                                     )
                             previous_tasks = new_tasks
 
-                    elif node_name == "finalize":
-                        if "messages" in node_update:
-                            last_msg = node_update["messages"][-1]
-                            if hasattr(last_msg, "content"):
-                                yield TokenEvent(content=last_msg.content)
+                        # writing 재시도 감지 (execute_writing 전용 부가 로직)
+                        if node_name == "execute_writing":
+                            attempts = node_update.get("writing_attempts", 0)
+                            if attempts == 2:
+                                yield WritingRetryEvent(
+                                    attempt=2,
+                                    feedback=last_validation_feedback or "",
+                                )
 
             elif mode == "messages":
+                # Sub-agent의 LLM token chunk
                 message_chunk, metadata = data
                 if hasattr(message_chunk, "content") and message_chunk.content:
                     if current_task_id:
@@ -131,7 +214,7 @@ async def convert_supervisor_events(
                             task_id=current_task_id,
                             content=message_chunk.content,
                         )
-
+                
     except Exception as e:
         # Stream 중간 발생한 예상치 못한 error
         yield ErrorEvent(
@@ -140,4 +223,6 @@ async def convert_supervisor_events(
             recoverable=True,
         )
 
+    # 정상 종료 
     yield DoneEvent(thread_id=thread_id)
+

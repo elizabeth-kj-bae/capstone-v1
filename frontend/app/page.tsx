@@ -17,15 +17,15 @@ export default function ChatPage() {
   const [useMultiAgent, setUseMultiAgent] = useState(true);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
-
+  
   useEffect(() => {
     setThreadId(getOrCreateThreadId());
   }, []);
-
+  
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
-
+  
   const handleSubmit = async (text: string) => {
     const userMessage: UISupervisorMessage = {
       id: crypto.randomUUID(),
@@ -33,25 +33,27 @@ export default function ChatPage() {
       content: text,
       tasks: [],
       taskTokens: {},
+      replans: [],
     };
-
+    
     const assistantMessage: UISupervisorMessage = {
       id: crypto.randomUUID(),
       role: 'assistant',
       content: '',
       tasks: [],
       taskTokens: {},
+      replans: [],
     };
-
+    
     setMessages(prev => [...prev, userMessage, assistantMessage]);
     setIsStreaming(true);
     setActiveTaskId(undefined);
-
+    
     abortControllerRef.current?.abort();
     abortControllerRef.current = new AbortController();
-
+    
     const endpoint = useMultiAgent ? '/chat/supervisor/stream' : '/chat/stream';
-
+    
     try {
       await sendChatMessage(
         BACKEND_URL,
@@ -62,35 +64,94 @@ export default function ChatPage() {
           setMessages(prev => {
             const updated = [...prev];
             const lastMsg = updated[updated.length - 1];
-
+            
             switch (event.type) {
               case 'token':
-                lastMsg.content += event.content;
+                // Immutable: lastMsg를 변이하지 않고 새 객체로 교체 (StrictMode 더블 인보크 안전)
+                updated[updated.length - 1] = {
+                  ...lastMsg,
+                  content: lastMsg.content + event.content,
+                };
+                break;
+              
+              // Routing 결정 수신
+              case 'routing_decided':
+                lastMsg.route = event.route;
+                lastMsg.routeReasoning = event.reasoning;
+                break;
+              
+              // Validation
+              case 'validation_completed':
+                lastMsg.validation = {
+                  is_acceptable: event.is_acceptable,
+                  score: event.score,
+                  reasoning: event.reasoning,
+                  will_retry: event.will_retry,
+                };
+                break;
+
+              case 'writing_retry':
+                lastMsg.writingRetried = true;
+                lastMsg.writingRetryFeedback = event.feedback;
+                // Task의 writing 항목을 다시 in_progress로 표시할 수도 있음
                 break;
 
               case 'plan_created':
                 lastMsg.plan = event.plan;
                 break;
-
+                
               case 'task_list_created':
                 lastMsg.tasks = event.tasks;
                 break;
+              
+              // Replan 결정 
+              case 'replan_decided': {
+                const prevReplans = lastMsg.replans ?? [];
+                const lastReplan = prevReplans[prevReplans.length - 1];
+                
+                // 같은 reasoning이면 동일 라운드의 update (replan 노드의 added_task_count 갱신)
+                // 다른 reasoning이면 새 라운드의 카드 추가
+                const isSameRound = lastReplan && lastReplan.reasoning === event.reasoning;
+                
+                const nextReplans = isSameRound
+                  ? [
+                      ...prevReplans.slice(0, -1),
+                      {
+                        ...lastReplan,
+                        added_task_count: event.added_task_count,
+                      },
+                    ]
+                  : [
+                      ...prevReplans,
+                      {
+                        is_sufficient: event.is_sufficient,
+                        reasoning: event.reasoning,
+                        added_task_count: event.added_task_count,
+                      },
+                    ];
+                
+                updated[updated.length - 1] = {
+                  ...lastMsg,
+                  replans: nextReplans,
+                };
+                break;
+              }
 
               case 'task_started':
                 lastMsg.tasks = lastMsg.tasks.map(t =>
-                  t.id === event.task_id
+                  t.id === event.task_id 
                     ? { ...t, status: 'in_progress' as const }
                     : t
                 );
                 setActiveTaskId(event.task_id);
                 break;
-
+                
               case 'task_completed':
                 lastMsg.tasks = lastMsg.tasks.map(t =>
                   t.id === event.task_id
-                    ? {
-                        ...t,
-                        status: event.status,
+                    ? { 
+                        ...t, 
+                        status: event.status, 
                         result: event.result_preview,
                         error_message: event.error_message,
                       }
@@ -100,18 +161,22 @@ export default function ChatPage() {
                   setActiveTaskId(undefined);
                 }
                 break;
-
+                
               case 'sub_agent_token':
-                lastMsg.taskTokens = {
-                  ...lastMsg.taskTokens,
-                  [event.task_id]: (lastMsg.taskTokens[event.task_id] || '') + event.content,
+                // Immutable: lastMsg.taskTokens 변이 대신 lastMsg 자체를 새 객체로 교체
+                updated[updated.length - 1] = {
+                  ...lastMsg,
+                  taskTokens: {
+                    ...lastMsg.taskTokens,
+                    [event.task_id]: (lastMsg.taskTokens[event.task_id] ?? '') + event.content,
+                  },
                 };
                 break;
-
+                
               case 'done':
                 break;
             }
-
+            
             return updated;
           });
         },
@@ -126,14 +191,14 @@ export default function ChatPage() {
       setActiveTaskId(undefined);
     }
   };
-
+  
   const handleNewThread = () => {
     abortControllerRef.current?.abort();
     setMessages([]);
     setThreadId(startNewThread());
     setActiveTaskId(undefined);
   };
-
+  
   return (
     <div className="flex flex-col h-screen max-w-4xl mx-auto">
       <header className="flex justify-between items-center p-4 border-b">
@@ -160,7 +225,7 @@ export default function ChatPage() {
           </button>
         </div>
       </header>
-
+      
       <main className="flex-1 overflow-y-auto p-4">
         {messages.length === 0 ? (
           <div className="text-center text-gray-400 mt-20">
@@ -168,16 +233,16 @@ export default function ChatPage() {
           </div>
         ) : (
           messages.map(msg => (
-            <ChatMessage
-              key={msg.id}
-              message={msg}
+            <ChatMessage 
+              key={msg.id} 
+              message={msg} 
               activeTaskId={activeTaskId}
             />
           ))
         )}
         <div ref={messagesEndRef} />
       </main>
-
+      
       <ChatInput onSubmit={handleSubmit} disabled={isStreaming} />
     </div>
   );

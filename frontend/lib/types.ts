@@ -46,7 +46,6 @@ export interface UIToolCall {
   status: 'pending' | 'completed';
 }
 
-
 /**
  * Multi-agent (Supervisor pattern) event types.
  * Backend schemas/stream.py와 1:1 대응.
@@ -91,14 +90,35 @@ export interface SubAgentTokenEvent {
   content: string;
 }
 
-export interface ErrorEvent {
-  type: 'error';
-  code: string;
-  message: string;
-  recoverable: boolean;
+export interface RoutingDecidedEvent {
+  type: 'routing_decided';
+  route: 'simple' | 'complex';
+  reasoning: string;
 }
 
-// 기존 StreamEvent type을 multi-agent 이벤트까지 확장
+export interface ValidationCompletedEvent {
+  type: 'validation_completed';
+  is_acceptable: boolean;
+  score: number;
+  reasoning: string;
+  will_retry: boolean;
+}
+
+export interface WritingRetryEvent {
+  type: 'writing_retry';
+  attempt: number;
+  feedback: string;
+}
+
+export interface ReplanDecidedEvent {
+  type: 'replan_decided';
+  is_sufficient: boolean;
+  reasoning: string;
+  added_task_count: number;
+}
+
+
+// 기존 StreamEvent type을 확장
 export type StreamEvent =
   | TokenEvent
   | ToolCallStartEvent
@@ -109,16 +129,58 @@ export type StreamEvent =
   | TaskStartedEvent
   | TaskCompletedEvent
   | SubAgentTokenEvent
-  | ErrorEvent;
+  | ErrorEvent
+  | RoutingDecidedEvent
+  | ValidationCompletedEvent
+  | WritingRetryEvent
+  | ReplanDecidedEvent;
 
-/**
- * UI에서 사용할 multi-agent 메시지 type.
- */
+
+// UI에서 사용할 Error 메시지 type
+export interface ErrorEvent {
+  type: 'error';
+  code: string;
+  message: string;
+  recoverable: boolean;
+}
+
+
+// UISupervisorMessage에 validation 정보 추가
+export interface ValidationInfo {
+  is_acceptable: boolean;
+  score: number;
+  reasoning: string;
+  will_retry: boolean;
+}
+
+// UISupervisorMessage에 replan 정보 추가
+export interface ReplanInfo {
+  is_sufficient: boolean;
+  reasoning: string;
+  added_task_count: number;
+}
+
+
+// UI에서 사용할 multi-agent 메시지 type 
 export interface UISupervisorMessage {
   id: string;
   role: 'user' | 'assistant';
   content: string;
+  
+  // Routing (Query Routing)
+  route?: 'simple' | 'complex';
+  routeReasoning?: string;
+  
+  // Multi-agent 전용 (route === 'complex'일 때만 의미)
   plan?: string;
   tasks: Task[];
   taskTokens: Record<string, string>;
+  
+  // Validation 
+  validation?: ValidationInfo;
+  writingRetried?: boolean;
+  writingRetryFeedback?: string;
+
+  // Dynamic Planning
+  replans: ReplanInfo[]; 
 }
