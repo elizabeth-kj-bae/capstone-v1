@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ruff_cache/
+# Node / Next.js
+node_modules/
+.next/
+*.tsbuildinfo
+next-env.d.ts
+# Env & secrets
+.env
+.env.*
+!.env.example
+# OS / Editor / Tooling
+.DS_Store
+.vscode/
+.idea/
+.claude/
+# 환경 스캐폴딩 (사전 구성됨)
+pyproject.toml
+uv.lock
+# git worktree 참조 폴더
+_ref/
