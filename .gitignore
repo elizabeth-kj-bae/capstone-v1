@@ -1,4 +1,5 @@
 # Python
+.python-version
 __pycache__/
 *.py[cod]
 .venv/
@@ -12,7 +13,6 @@ next-env.d.ts
 # Env & secrets
 .env
 .env.*
-!.env.example
 # OS / Editor / Tooling
 .DS_Store
 .vscode/
