@@ -7,3 +7,4 @@
 - `backend/agent/supervisor_graph.py`(flat) → `backend/agent/supervisor/v1/`(legacy) + `v2/`(modular) 패키지로 분리
 - `backend/config.py` — LLM 모델, MAX_REPLAN_ROUNDS 등 설정 통합
 - `backend/main.py` — 환경변수 `SUPERVISOR_VERSION`(v1/v2)으로 supervisor 구현 전환
+
