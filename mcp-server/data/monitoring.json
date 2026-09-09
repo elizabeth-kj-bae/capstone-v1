@@ -1,0 +1,46 @@
+{
+  "auth-service": {
+    "status": "degraded",
+    "cpu_percent": 78.4,
+    "memory_percent": 71.2,
+    "alerts": [
+      "login_failure_rate above 20% for last 10m",
+      "p95 latency 1.8s (threshold 800ms)"
+    ]
+  },
+  "payment-db": {
+    "status": "healthy",
+    "cpu_percent": 32.1,
+    "memory_percent": 54.6,
+    "alerts": []
+  },
+  "api-gateway": {
+    "status": "degraded",
+    "cpu_percent": 65.0,
+    "memory_percent": 60.3,
+    "alerts": [
+      "5xx error rate 4.2% (threshold 1%)"
+    ]
+  },
+  "order-service": {
+    "status": "healthy",
+    "cpu_percent": 41.7,
+    "memory_percent": 48.9,
+    "alerts": []
+  },
+  "user-db": {
+    "status": "down",
+    "cpu_percent": 0.0,
+    "memory_percent": 0.0,
+    "alerts": [
+      "instance unreachable for 3m",
+      "health check failing"
+    ]
+  },
+  "notification-worker": {
+    "status": "healthy",
+    "cpu_percent": 22.5,
+    "memory_percent": 38.0,
+    "alerts": []
+  }
+}
