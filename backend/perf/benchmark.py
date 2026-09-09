@@ -16,7 +16,7 @@ BACKEND_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BACKEND_DIR))
 load_dotenv(BACKEND_DIR.parent / ".env")
 
-from agent.supervisor_graph import build_supervisor_graph
+from agent.supervisor.v1.supervisor_graph import build_supervisor_graph
 
 
 # 본 capstone 도메인의 benchmark 질문 셋
