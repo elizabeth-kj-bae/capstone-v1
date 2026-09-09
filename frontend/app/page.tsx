@@ -88,7 +88,12 @@ export default function ChatPage() {
               case 'task_completed':
                 lastMsg.tasks = lastMsg.tasks.map(t =>
                   t.id === event.task_id
-                    ? { ...t, status: 'completed' as const, result: event.result_preview }
+                    ? {
+                        ...t,
+                        status: event.status,
+                        result: event.result_preview,
+                        error_message: event.error_message,
+                      }
                     : t
                 );
                 if (activeTaskId === event.task_id) {

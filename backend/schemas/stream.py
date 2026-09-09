@@ -6,11 +6,12 @@ SSE Streaming 이벤트 schema.
 - Pydantic v2로 타입 검증
 """
 from pydantic import BaseModel, Field
-from typing import Literal, Optional
+from typing import Literal, Optional, Any
 
 class StreamEvent(BaseModel):
     """모든 SSE event의 base class."""
     type: str
+
 
 class TokenEvent(StreamEvent):
     """LLM 응답의 token chunk."""
@@ -18,6 +19,7 @@ class TokenEvent(StreamEvent):
     content: str = Field(
         description="이번 chunk의 텍스트 내용"
     )
+
 
 class ToolCallStartEvent(StreamEvent):
     """Agent가 tool 호출을 시작."""
@@ -28,6 +30,7 @@ class ToolCallStartEvent(StreamEvent):
     args: dict = Field(
         description="tool에 전달된 인자"
     )
+
 
 class ToolCallEndEvent(StreamEvent):
     """Tool 응답이 도착하여 호출 종료."""
@@ -40,6 +43,7 @@ class ToolCallEndEvent(StreamEvent):
         description="tool의 응답 (요약/preview)"
     )
 
+
 class DoneEvent(StreamEvent):
     """Stream 정상 종료 신호."""
     type: Literal["done"] = "done"
@@ -47,8 +51,6 @@ class DoneEvent(StreamEvent):
         description="이번 stream의 thread_id"
     )
 
-
-# ===== Day2 Multi-agent(Supervisor) 이벤트 =====
 
 class PlanCreatedEvent(BaseModel):
     type: Literal["plan_created"] = "plan_created"
@@ -71,10 +73,9 @@ class TaskStartedEvent(BaseModel):
 class TaskCompletedEvent(BaseModel):
     type: Literal["task_completed"] = "task_completed"
     task_id: str
-    result_preview: Optional[str] = Field(
-        default=None,
-        description="결과 요약 (200자 내외)"
-    )
+    status: Literal["completed", "failed"] = "completed"  # 추가
+    result_preview: Optional[str] = None
+    error_message: Optional[str] = None  # 추가
 
 
 class SubAgentTokenEvent(BaseModel):
@@ -92,3 +93,12 @@ class SubAgentToolCallEvent(BaseModel):
     status: Literal["start", "end"]
     result: Optional[str] = None
 
+
+class ErrorEvent(BaseModel):
+    """Stream 중 발생한 error를 사용자에게 전달."""
+    type: Literal["error"] = "error"
+    code: str = Field(description="Error 코드")
+    message: str = Field(description="사용자 친화적 메시지")
+    recoverable: bool = Field(
+        description="복구 가능한 error인지. true면 frontend가 부분 응답을 유지"
+    )
