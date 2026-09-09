@@ -27,11 +27,6 @@ export interface DoneEvent {
   thread_id: string;
 }
 
-export type StreamEvent =
-  | TokenEvent
-  | ToolCallStartEvent
-  | ToolCallEndEvent
-  | DoneEvent;
 
 /**
  * UI에서 사용할 메시지 type.
@@ -49,4 +44,70 @@ export interface UIToolCall {
   args: Record<string, unknown>;
   result?: string;
   status: 'pending' | 'completed';
+}
+
+
+/**
+ * Multi-agent (Supervisor pattern) event types.
+ * Backend schemas/stream.py와 1:1 대응.
+ */
+
+export interface PlanCreatedEvent {
+  type: 'plan_created';
+  plan: string;
+}
+
+export interface Task {
+  id: string;
+  description: string;
+  agent: string;
+  status: 'pending' | 'in_progress' | 'completed';
+  result?: string;
+}
+
+export interface TaskListCreatedEvent {
+  type: 'task_list_created';
+  tasks: Task[];
+}
+
+export interface TaskStartedEvent {
+  type: 'task_started';
+  task_id: string;
+  agent_name: string;
+}
+
+export interface TaskCompletedEvent {
+  type: 'task_completed';
+  task_id: string;
+  result_preview?: string;
+}
+
+export interface SubAgentTokenEvent {
+  type: 'sub_agent_token';
+  task_id: string;
+  content: string;
+}
+
+// 기존 StreamEvent type을 multi-agent 이벤트까지 확장
+export type StreamEvent =
+  | TokenEvent
+  | ToolCallStartEvent
+  | ToolCallEndEvent
+  | DoneEvent
+  | PlanCreatedEvent
+  | TaskListCreatedEvent
+  | TaskStartedEvent
+  | TaskCompletedEvent
+  | SubAgentTokenEvent;
+
+/**
+ * UI에서 사용할 multi-agent 메시지 type.
+ */
+export interface UISupervisorMessage {
+  id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  plan?: string;
+  tasks: Task[];
+  taskTokens: Record<string, string>;
 }

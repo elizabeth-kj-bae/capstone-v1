@@ -18,12 +18,13 @@ import type { StreamEvent } from './types';
  */
 export async function sendChatMessage(
   backendUrl: string,
+  endpoint: string,
   message: string,
   threadId: string,
   onEvent: (event: StreamEvent) => void,
   signal?: AbortSignal,
 ): Promise<void> {
-  const response = await fetch(`${backendUrl}/chat/stream`, {
+  const response = await fetch(`${backendUrl}${endpoint}`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',

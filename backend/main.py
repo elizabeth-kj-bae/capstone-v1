@@ -2,7 +2,8 @@
 FastAPI backend 진입점.
 
 - POST /chat: 단순 request/response
-- POST /chat/stream: SSE streaming (Day2)
+- POST /chat/stream: 단일 agent SSE streaming
+- POST /chat/supervisor/stream: multi-agent(Supervisor) SSE streaming
 - 에러 처리는 graceful degradation 없이 처리
 """
 import uuid
@@ -11,23 +12,25 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from agent.graph import build_agent
+from agent.supervisor_graph import build_supervisor_graph
 from schemas.chat import ChatRequest, ChatResponse
 from streaming.sse_formatter import format_sse
-from streaming.event_converter import convert_langgraph_events
+from streaming.event_converter import convert_langgraph_events, convert_supervisor_events
 
 
 # Agent를 lifespan으로 1회 생성 (서버 시작 시)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: agent 생성
+    # Startup: 단일 agent + supervisor graph 생성
     app.state.agent = await build_agent()
+    app.state.supervisor_graph = await build_supervisor_graph()
     yield
     # Shutdown: 별도 정리 필요시 여기에
 
 
 app = FastAPI(
     title="ICT Operations Support Backend",
-    description="Capstone Day 2 — RAG + Agent + MCP + Streaming",
+    description="Capstone Day 2 — Single + Multi-agent Streaming",
     lifespan=lifespan,
 )
 
@@ -79,11 +82,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
 @app.post("/chat/stream")
 async def chat_stream(request: ChatRequest):
     """
-    Streaming chat endpoint.
-
-    Day 2 추가:
-    - SSE (Server-Sent Events) format으로 stream
-    - 4가지 event type: token, tool_call_start, tool_call_end, done
+    단일 agent Streaming chat endpoint (SSE).
     """
     thread_id = request.thread_id or str(uuid.uuid4())
 
@@ -104,5 +103,34 @@ async def chat_stream(request: ChatRequest):
             "X-Accel-Buffering": "no",
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
+        },
+    )
+
+
+@app.post("/chat/supervisor/stream")
+async def chat_supervisor_stream(request: ChatRequest):
+    """
+    Multi-agent (Supervisor pattern) streaming endpoint.
+
+    Day 2 Multi-agent UX hands-on용.
+    """
+    thread_id = request.thread_id or str(uuid.uuid4())
+
+    async def event_generator():
+        config = {"configurable": {"thread_id": thread_id}}
+        supervisor_stream = app.state.supervisor_graph.astream(
+            {"messages": [{"role": "user", "content": request.message}]},
+            config=config,
+            stream_mode=["messages", "updates"],
+        )
+        async for event in convert_supervisor_events(supervisor_stream, thread_id):
+            yield format_sse(event)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "X-Accel-Buffering": "no",
+            "Cache-Control": "no-cache",
         },
     )
