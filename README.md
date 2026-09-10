@@ -7,9 +7,13 @@
 ## 사용법
 
 ### 사전 준비
-Git 설치가 되어 있지 않다면, 아래 내용 참고하여 설치 바랍니다. 
-- 설치 확인 : 터미널에서 `git --version` 실행 후 버전 확인
-- 설치 필요 : [Homebrew](https://brew.sh) 사용 시 `brew install git` 
+- Git 설치 확인 
+    - 설치 확인 : 터미널에서 `git --version` 실행 후 버전 확인
+    - 설치 필요 : [Homebrew](https://brew.sh) 사용 시 `brew install git` 
+
+- 환경 설정 
+    - 과정 전에 안내된 노션 참고하여 환경 구성
+
 
 ### 실행 (최초 1회) 
 ```bash
@@ -42,5 +46,10 @@ bash setup.sh
 
 > `refactor/v2` 브랜치는 Part C · product-grade 리팩터링 참고본 입니다.
 
-## 환경 설정 
-각 완성본 실행에는 `.env`가 필요합니다. 과정 전에 안내된 노션 참고하여 구성 합니다.
+
+## Licence 
+© 2025–2026 Keejoo Bae — SK AX / SKALA. All rights reserved.
+
+Provided for educational use in this course. You may clone, run, and modify it
+for your own learning. **Commercial use and redistribution — of the original or
+modified versions — are not permitted.** See [LICENSE](./LICENSE).
