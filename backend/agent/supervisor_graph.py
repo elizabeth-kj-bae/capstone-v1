@@ -2,14 +2,15 @@
 Supervisor 패턴 기반 Multi-agent Graph.
 """
 import asyncio
-from typing import TypedDict, Annotated, Literal
+from typing import TypedDict, Annotated, Literal, Optional
+from pydantic import BaseModel, Field
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langchain_core.messages import BaseMessage, AIMessage, HumanMessage, SystemMessage
 from langgraph.graph.message import add_messages
 from langchain_openai import ChatOpenAI  
 from langchain.agents import create_agent
-from langgraph.checkpoint.base import BaseCheckpointSaver
 from .mcp_client import get_mcp_tools
 from schemas.error import ToolError, OrchestrationError, CapstoneError, ErrorLayer
 
@@ -25,29 +26,57 @@ class SupervisorState(TypedDict):
     - current_task_index: 현재 진행 중인 task
     """
     messages: Annotated[list[BaseMessage], add_messages]
+
+    # Routing
+    route: Optional[Literal["simple", "complex"]]  # Routing 결정
+    route_reasoning: Optional[str]  # 결정 근거 (LangSmith trace에 기록)
+
+    # Base
     plan: str
     tasks: list[dict]  # [{id, description, agent, status, result}, ...]
     current_task_index: int
+
+
+
+class RoutingDecision(BaseModel):
+    """Supervisor의 routing 결정."""
+    route: Literal["simple", "complex"] = Field(
+        description="질문의 복잡도. simple: 인사·메타질문·단순한 정보 요청. complex: 정보 수집·통합·분석이 필요한 작업"
+    )
+    reasoning: str = Field(
+        description="결정 근거를 한 문장으로"
+    )
 
 
 async def build_supervisor_graph(checkpointer: BaseCheckpointSaver):
     """
     Supervisor 기반 multi-agent graph 생성.
 
-    Cost/Latency 최적화:
-    - Planning: 빠르고 저렴한 모델 (단순 분류/구조화 task)
-    - Research/Writing: 고품질 모델 (정보 추출 + 응답 생성 품질 중요)
-    - Research task 병렬 실행 (fan-out / fan-in)
+    Cost & Latency 최적화: 
+    - Planning : 빠르고 저렴한 모델 (단순 분류/구조화 task)
+    - Writing : 고품질 모델 (정보 추출 + 응답 생성 품질 중요)
+
+    Session 관리 강화:
+    - checkpointer를 외부에서 주입 받음 
+    - Agent 코드는 checkpointer 구현체와 분리함
+
+    Routing 추가: Simple vs Complex Response 
     """
+    # 기존 버전 - 동일 모델 적용 
+    # llm = ChatOpenAI(model="gpt-4o", temperature=0)
+
+
     # 단계별 모델 분리
     fast_llm = ChatOpenAI(
         model="gpt-4o-mini",  # 빠르고 저렴
         temperature=0,
     )
+    
     quality_llm = ChatOpenAI(
         model="gpt-4o",  # 품질 우선
         temperature=0,
     )
+
     
     # Sub-agent 1: Research Agent (MCP tools 사용)
     mcp_tools = await get_mcp_tools()
@@ -71,7 +100,74 @@ async def build_supervisor_graph(checkpointer: BaseCheckpointSaver):
             "통합된 답변을 작성하세요."
         ),
     )
-    
+
+    # Routing Node 
+    async def routing_node(state: SupervisorState) -> dict:
+        """
+        사용자 질문의 복잡도를 판단하여 경로 결정.
+        
+        - simple: Supervisor가 LLM 한 번으로 직접 답변
+        - complex: 기존 multi-agent flow (Planning → Research → Writing)
+        """
+        user_msg = state["messages"][-1].content
+        
+        routing_prompt = f"""\
+다음 사용자 질문을 분석하여 처리 경로를 결정하세요.
+
+사용자 질문: {user_msg}
+
+판단 기준:
+- simple: 인사, 메타 질문, 단일 LLM 호출로 답변 가능한 단순 정보 요청
+  예: "안녕하세요", "당신은 누구인가요?", "어떻게 사용하나요?"
+- complex: 정보 수집(검색), 통합, 분석이 필요한 작업
+  예: "DB 다운 시 대응 절차와 incident를 종합해 가이드 작성"
+
+route와 reasoning을 응답하세요.
+"""
+        # Structured output으로 안정성 확보
+        decision = await fast_llm.with_structured_output(RoutingDecision).ainvoke([
+            SystemMessage(content="You are a routing classifier."),
+            HumanMessage(content=routing_prompt),
+        ])
+        
+        return {
+            "route": decision.route,
+            "route_reasoning": decision.reasoning,
+        }
+
+    # Routing - Simple Response Node
+    async def simple_response_node(state: SupervisorState) -> dict:
+        """
+        단순 질문에 LLM 한 번 호출로 직접 답변.
+        Plan, Task list 없이 바로 응답.
+        """
+        user_msg = state["messages"][-1].content
+        
+        system_prompt = (
+            "당신은 ICT 운영 지원 AI 어시스턴트입니다. "
+            "사용자의 질문에 친절하고 정확하게 답변하세요. "
+            "복잡한 정보 수집이 필요한 경우 별도 안내가 가능하다고 알려주세요."
+        )
+        
+        response = await quality_llm.ainvoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_msg),
+        ])
+        
+        return {
+            "messages": [AIMessage(content=response.content)],
+        }
+
+    # Routing - Routing 결정에 따른 분기 함수
+    def route_after_routing(state: SupervisorState) -> Literal["simple_response", "planning"]:
+        """
+        routing_node가 채운 state["route"]에 따라 처리 경로 결정.
+
+        - route == "simple"  → simple_response (LLM 1회 직접 응답)
+        - route == "complex" → planning (multi-agent flow)
+        """
+        return "simple_response" if state.get("route") == "simple" else "planning"
+
     # Supervisor의 Planning 함수 (fast_llm 사용)
     async def planning_node(state: SupervisorState) -> dict:
         """
@@ -194,7 +290,8 @@ async def build_supervisor_graph(checkpointer: BaseCheckpointSaver):
             "tasks": tasks,
             "current_task_index": new_index,
         }
-    
+
+    # Task 실행 -- Writing
     async def execute_writing_task_node(state: SupervisorState) -> dict:
         """
         Writing task 실행 (모든 research 결과를 context로).
@@ -285,19 +382,37 @@ async def build_supervisor_graph(checkpointer: BaseCheckpointSaver):
         return {
             "messages": [AIMessage(content=final_response)],
         }
-    
-    # Graph 구성 (병렬 실행 적용)
+
+    # Graph 구성
     workflow = StateGraph(SupervisorState)
+
+    workflow.add_node("routing", routing_node)
+    workflow.add_node("simple_response", simple_response_node)
     workflow.add_node("planning", planning_node)
-    workflow.add_node("execute_research", execute_all_research_tasks_node)  # 병렬 처리 노드
+    workflow.add_node("execute_research", execute_all_research_tasks_node)
     workflow.add_node("execute_writing", execute_writing_task_node)
     workflow.add_node("finalize", finalize_node)
     
-    workflow.add_edge(START, "planning")
+    # Routing
+    workflow.add_edge(START, "routing")
+    workflow.add_conditional_edges(
+        "routing",
+        route_after_routing,
+        {
+            "simple_response": "simple_response",
+            "planning": "planning",
+        }
+    )
+    workflow.add_edge("simple_response", END)  # Simple 경로는 바로 종료
+
+    # Complex
     workflow.add_edge("planning", "execute_research")
     workflow.add_edge("execute_research", "execute_writing")
+
     workflow.add_edge("execute_writing", "finalize")
     workflow.add_edge("finalize", END)
     
-    # Checkpointer는 외부에서 주입받음 (MemorySaver / AsyncPostgresSaver)
+    # Checkpointer (in-memory)
+    # checkpointer = MemorySaver()
+    
     return workflow.compile(checkpointer=checkpointer)

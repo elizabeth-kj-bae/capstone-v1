@@ -20,7 +20,9 @@ from schemas.stream import (
     TaskStartedEvent,
     TaskCompletedEvent,
     SubAgentTokenEvent,
+    SubAgentToolCallEvent,
     ErrorEvent,
+    RoutingDecidedEvent,
 )
 
 
@@ -78,38 +80,64 @@ async def convert_supervisor_events(
 ):
     """
     Supervisor graph의 stream event를 본 capstone SSE event로 변환.
-
+    
     Multi-agent 시나리오의 event들을 frontend가 가시화할 수 있는 형태로 송출.
-    Graceful Degradation: stream 중 예외는 ErrorEvent로 전달.
+    (+) routing event 추가.
     """
-    current_task_id = None
-    previous_tasks = None
-
+    current_task_id = None  # 현재 활성 task
+    previous_tasks = None   # 이전 state의 tasks (변화 감지용)
+        
     try:
-        async for mode, data in supervisor_stream:
+        async for mode, data in supervisor_stream: 
 
             if mode == "updates":
+                # 어느 node가 업데이트되었는지 확인
                 for node_name, node_update in data.items():
+                    
+                    if node_name == "routing":
+                        if "route" in node_update:
+                            yield RoutingDecidedEvent(
+                                route=node_update["route"],
+                                reasoning=node_update.get("route_reasoning", ""),
+                            )
+                    
+                    elif node_name == "simple_response":
+                        if "messages" in node_update:
+                            last_msg = node_update["messages"][-1]
+                            if hasattr(last_msg, "content"):
+                                yield TokenEvent(content=last_msg.content)
 
-                    if node_name == "planning":
+                    elif node_name == "planning":
+                        # Planning 완료 → plan_created + task_list_created
                         if "plan" in node_update:
                             yield PlanCreatedEvent(plan=node_update["plan"])
                         if "tasks" in node_update:
                             yield TaskListCreatedEvent(tasks=node_update["tasks"])
                             previous_tasks = node_update["tasks"]
+                        
+                    elif node_name == "finalize":
+                        # 최종 응답 → 기존 token event로 흘려보냄 (단순화)
+                        if "messages" in node_update:
+                            last_msg = node_update["messages"][-1]
+                            if hasattr(last_msg, "content"):
+                                # 전체 응답을 한 번에 보냄 (단순화)
+                                yield TokenEvent(content=last_msg.content)
 
-                    # a31부터 execute 노드가 execute_research(병렬) / execute_writing 으로 분리됨
-                    elif node_name in ("execute", "execute_research", "execute_writing"):
+                    elif node_name in ("execute_research", "execute_writing"):
+                        # 모든 execute_* 노드 공통: tasks status diff로 lifecycle 이벤트 발행.
+                        # agent 종류와 무관하게 동일 로직 적용 (research·writing 모두 처리).
                         if "tasks" in node_update:
                             new_tasks = node_update["tasks"]
                             for new_t, old_t in zip(new_tasks, previous_tasks or []):
-                                if new_t["status"] == "in_progress" and old_t["status"] == "pending":
+                                if (new_t["status"] == "in_progress"
+                                        and old_t["status"] == "pending"):
                                     yield TaskStartedEvent(
                                         task_id=new_t["id"],
                                         agent_name=new_t["agent"],
                                     )
                                     current_task_id = new_t["id"]
-                                elif new_t["status"] in ["completed", "failed"] and old_t["status"] != new_t["status"]:
+                                elif (new_t["status"] in ("completed", "failed")
+                                        and old_t["status"] != new_t["status"]):
                                     yield TaskCompletedEvent(
                                         task_id=new_t["id"],
                                         status=new_t["status"],
@@ -118,13 +146,8 @@ async def convert_supervisor_events(
                                     )
                             previous_tasks = new_tasks
 
-                    elif node_name == "finalize":
-                        if "messages" in node_update:
-                            last_msg = node_update["messages"][-1]
-                            if hasattr(last_msg, "content"):
-                                yield TokenEvent(content=last_msg.content)
-
             elif mode == "messages":
+                # Sub-agent의 LLM token chunk
                 message_chunk, metadata = data
                 if hasattr(message_chunk, "content") and message_chunk.content:
                     if current_task_id:
@@ -132,7 +155,7 @@ async def convert_supervisor_events(
                             task_id=current_task_id,
                             content=message_chunk.content,
                         )
-
+                
     except Exception as e:
         # Stream 중간 발생한 예상치 못한 error
         yield ErrorEvent(
@@ -141,4 +164,6 @@ async def convert_supervisor_events(
             recoverable=True,
         )
 
+    # 정상 종료 
     yield DoneEvent(thread_id=thread_id)
+

@@ -68,6 +68,12 @@ export default function ChatPage() {
                 lastMsg.content += event.content;
                 break;
 
+              // Routing 결정 수신 (Part B-1)
+              case 'routing_decided':
+                lastMsg.route = event.route;
+                lastMsg.routeReasoning = event.reasoning;
+                break;
+
               case 'plan_created':
                 lastMsg.plan = event.plan;
                 break;

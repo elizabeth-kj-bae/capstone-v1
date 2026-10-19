@@ -102,3 +102,16 @@ class ErrorEvent(BaseModel):
     recoverable: bool = Field(
         description="복구 가능한 error인지. true면 frontend가 부분 응답을 유지"
     )
+
+
+class RoutingDecidedEvent(BaseModel):
+    """
+    Supervisor의 routing 결정을 frontend에 알림.
+    
+    Frontend는 이 event를 받아:
+    - simple: 단순 응답 UI 모드 (Plan/Task 카드 표시 안 함)
+    - complex: 기존 multi-agent UI 모드 (Plan/Task 카드 표시)
+    """
+    type: Literal["routing_decided"] = "routing_decided"
+    route: Literal["simple", "complex"]
+    reasoning: str = Field(description="결정 근거")
