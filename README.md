@@ -1,13 +1,16 @@
-# a32 · Stateless Session (Day3)
+# b10 · Supervisor 시작점 (Part B)
 
-이 태그는 **state 영속화 단계의 완성본**입니다. in-memory → PostgreSQL checkpointer로 전환합니다. (Part A의 마지막 단계)
+이 태그는 **Part B의 출발 상태**입니다. 코드는 Part A 완료 시점(`a32`)의 supervisor와 동일하며,
+여기서부터 4가지 개선을 더해 `b20`으로 발전시킵니다.
 
-## 이 단계에서 완성되어야 할 것
-- `docker-compose.yml` — PostgreSQL 16 컨테이너
-- `backend/persistence/checkpointer.py` — `AsyncPostgresSaver` 팩토리(lifecycle 관리)
-- `backend/agent/graph.py`, `backend/agent/supervisor_graph.py` — checkpointer를 **외부 주입**받도록 변경(MemorySaver 생성 제거)
-- `backend/main.py` — lifespan에서 checkpointer를 한 번 생성해 두 graph가 공유
-- Backend 재시작/멀티 인스턴스에서도 thread state가 이어지는지 검증
+## 현재 supervisor 구조
+`planning → execute_research(병렬) → execute_writing → finalize`
+
+## Part B에서 더할 것 (→ b20)
+1. Query Routing — 단순 질문은 Supervisor가 직접 답, 복잡한 질문만 multi-agent
+2. Validator sub-agent — 최종 응답 품질 검증
+3. Conditional Routing — Supervisor 내부 분기
+4. Dynamic Planning — Supervisor 자체 판단(replan)
 
 ## 이전 / 다음
-이전: `a31-cost-latency` · 다음: `b10-supervisor-start` (Part B)
+이전: `a32-stateless` · 다음: `b11-supervisor-routing`
