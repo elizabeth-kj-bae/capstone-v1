@@ -98,7 +98,8 @@ async def convert_supervisor_events(
                             yield TaskListCreatedEvent(tasks=node_update["tasks"])
                             previous_tasks = node_update["tasks"]
 
-                    elif node_name == "execute":
+                    # a31부터 execute 노드가 execute_research(병렬) / execute_writing 으로 분리됨
+                    elif node_name in ("execute", "execute_research", "execute_writing"):
                         if "tasks" in node_update:
                             new_tasks = node_update["tasks"]
                             for new_t, old_t in zip(new_tasks, previous_tasks or []):
