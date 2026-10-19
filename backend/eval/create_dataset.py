@@ -36,7 +36,7 @@ examples = [
         },
         "outputs": {
             "expected_topics": ["시스템 상태", "ticket 목록"],
-            "expected_tools_used": ["check_system_status", "search_tickets"],
+            "expected_tools_used": ["get_monitoring_status", "search_jira_tickets"],
             "should_include_steps": False,
         }
     },
@@ -46,7 +46,7 @@ examples = [
         },
         "outputs": {
             "expected_topics": ["매뉴얼", "incident", "통합 가이드"],
-            "expected_tools_used": ["search_operations_manual", "search_tickets"],
+            "expected_tools_used": ["search_operations_manual", "search_jira_tickets"],
             "should_include_steps": True,
         }
     },
