@@ -1,10 +1,11 @@
 # 임시 테스트 코드 
 import asyncio
+from langgraph.checkpoint.memory import MemorySaver
 from agent.graph import build_agent
 from streaming.event_converter import convert_langgraph_events
 
 async def test_stream():
-    agent = await build_agent()
+    agent = await build_agent(MemorySaver())  # a32부터 checkpointer 외부 주입 필수 → 오프라인 스크립트는 in-memory 사용
     langgraph_stream = agent.astream(
         {"messages": [{"role": "user", "content": "운영 매뉴얼 검색해 주세요"}]},
         config={"configurable": {"thread_id": "test-001"}},

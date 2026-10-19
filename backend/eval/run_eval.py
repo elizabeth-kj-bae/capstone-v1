@@ -12,6 +12,7 @@ load_dotenv(BACKEND_DIR.parent / ".env")
 import asyncio
 import uuid
 from langsmith import aevaluate
+from langgraph.checkpoint.memory import MemorySaver
 from agent.supervisor_graph import build_supervisor_graph
 from eval.evaluators import has_expected_topics, response_quality_judge
 
@@ -26,7 +27,7 @@ async def target_function(inputs: dict) -> dict:
     Returns:
         agent의 응답 dict
     """
-    graph = await build_supervisor_graph()
+    graph = await build_supervisor_graph(MemorySaver())  # a32부터 checkpointer 외부 주입 필수 → 오프라인 스크립트는 in-memory 사용
     
     config = {"configurable": {"thread_id": str(uuid.uuid4())}}
     result = await graph.ainvoke(

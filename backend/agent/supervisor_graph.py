@@ -9,6 +9,7 @@ from langchain_core.messages import BaseMessage, AIMessage, HumanMessage, System
 from langgraph.graph.message import add_messages
 from langchain_openai import ChatOpenAI  
 from langchain.agents import create_agent
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from .mcp_client import get_mcp_tools
 from schemas.error import ToolError, OrchestrationError, CapstoneError, ErrorLayer
 
@@ -29,7 +30,7 @@ class SupervisorState(TypedDict):
     current_task_index: int
 
 
-async def build_supervisor_graph():
+async def build_supervisor_graph(checkpointer: BaseCheckpointSaver):
     """
     Supervisor 기반 multi-agent graph 생성.
 
@@ -298,7 +299,5 @@ async def build_supervisor_graph():
     workflow.add_edge("execute_writing", "finalize")
     workflow.add_edge("finalize", END)
     
-    # Checkpointer (in-memory, Day 1과 동일)
-    checkpointer = MemorySaver()
-    
+    # Checkpointer는 외부에서 주입받음 (MemorySaver / AsyncPostgresSaver)
     return workflow.compile(checkpointer=checkpointer)

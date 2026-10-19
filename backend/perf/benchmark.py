@@ -16,6 +16,7 @@ BACKEND_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BACKEND_DIR))
 load_dotenv(BACKEND_DIR.parent / ".env")
 
+from langgraph.checkpoint.memory import MemorySaver
 from agent.supervisor_graph import build_supervisor_graph
 
 
@@ -52,7 +53,7 @@ async def benchmark_single_request(graph, question: str) -> dict:
 async def main():
     """벤치마크 실행."""
     print("Building supervisor graph...")
-    graph = await build_supervisor_graph()
+    graph = await build_supervisor_graph(MemorySaver())  # a32부터 checkpointer 외부 주입 필수 → 오프라인 스크립트는 in-memory 사용
     
     print(f"\nRunning benchmark on {len(BENCHMARK_QUESTIONS)} questions...\n")
     
