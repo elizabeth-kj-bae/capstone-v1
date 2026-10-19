@@ -20,6 +20,7 @@ from schemas.stream import (
     TaskStartedEvent,
     TaskCompletedEvent,
     SubAgentTokenEvent,
+    ErrorEvent,
 )
 
 
@@ -79,60 +80,64 @@ async def convert_supervisor_events(
     Supervisor graph의 stream event를 본 capstone SSE event로 변환.
 
     Multi-agent 시나리오의 event들을 frontend가 가시화할 수 있는 형태로 송출.
+    Graceful Degradation: stream 중 예외는 ErrorEvent로 전달.
     """
-    current_task_id = None  # 현재 활성 task
-    previous_tasks = None   # 이전 state의 tasks (변화 감지용)
+    current_task_id = None
+    previous_tasks = None
 
-    async for mode, data in supervisor_stream:
+    try:
+        async for mode, data in supervisor_stream:
 
-        if mode == "updates":
-            # 어느 node가 업데이트되었는지 확인
-            for node_name, node_update in data.items():
+            if mode == "updates":
+                for node_name, node_update in data.items():
 
-                if node_name == "planning":
-                    # Planning 완료 → plan_created + task_list_created
-                    if "plan" in node_update:
-                        yield PlanCreatedEvent(plan=node_update["plan"])
-                    if "tasks" in node_update:
-                        yield TaskListCreatedEvent(tasks=node_update["tasks"])
-                        previous_tasks = node_update["tasks"]
+                    if node_name == "planning":
+                        if "plan" in node_update:
+                            yield PlanCreatedEvent(plan=node_update["plan"])
+                        if "tasks" in node_update:
+                            yield TaskListCreatedEvent(tasks=node_update["tasks"])
+                            previous_tasks = node_update["tasks"]
 
-                elif node_name == "execute":
-                    # Task 실행 → 상태 변화 감지하여 event 발행
-                    if "tasks" in node_update:
-                        new_tasks = node_update["tasks"]
-                        # 이전과 비교해 상태 변화 감지
-                        for new_t, old_t in zip(new_tasks, previous_tasks or []):
-                            if new_t["status"] == "in_progress" and old_t["status"] == "pending":
-                                yield TaskStartedEvent(
-                                    task_id=new_t["id"],
-                                    agent_name=new_t["agent"],
-                                )
-                                current_task_id = new_t["id"]
-                            elif new_t["status"] == "completed" and old_t["status"] != "completed":
-                                yield TaskCompletedEvent(
-                                    task_id=new_t["id"],
-                                    result_preview=(new_t["result"] or "")[:200],
-                                )
-                        previous_tasks = new_tasks
+                    elif node_name == "execute":
+                        if "tasks" in node_update:
+                            new_tasks = node_update["tasks"]
+                            for new_t, old_t in zip(new_tasks, previous_tasks or []):
+                                if new_t["status"] == "in_progress" and old_t["status"] == "pending":
+                                    yield TaskStartedEvent(
+                                        task_id=new_t["id"],
+                                        agent_name=new_t["agent"],
+                                    )
+                                    current_task_id = new_t["id"]
+                                elif new_t["status"] in ["completed", "failed"] and old_t["status"] != new_t["status"]:
+                                    yield TaskCompletedEvent(
+                                        task_id=new_t["id"],
+                                        status=new_t["status"],
+                                        result_preview=(new_t.get("result") or "")[:200] if new_t.get("result") else None,
+                                        error_message=new_t.get("error_message"),
+                                    )
+                            previous_tasks = new_tasks
 
-                elif node_name == "finalize":
-                    # 최종 응답 → 기존 token event로 흘려보냄 (단순화)
-                    if "messages" in node_update:
-                        last_msg = node_update["messages"][-1]
-                        if hasattr(last_msg, "content"):
-                            # 전체 응답을 한 번에 보냄 (단순화)
-                            yield TokenEvent(content=last_msg.content)
+                    elif node_name == "finalize":
+                        if "messages" in node_update:
+                            last_msg = node_update["messages"][-1]
+                            if hasattr(last_msg, "content"):
+                                yield TokenEvent(content=last_msg.content)
 
-        elif mode == "messages":
-            # Sub-agent의 LLM token chunk
-            message_chunk, metadata = data
-            if hasattr(message_chunk, "content") and message_chunk.content:
-                if current_task_id:
-                    yield SubAgentTokenEvent(
-                        task_id=current_task_id,
-                        content=message_chunk.content,
-                    )
+            elif mode == "messages":
+                message_chunk, metadata = data
+                if hasattr(message_chunk, "content") and message_chunk.content:
+                    if current_task_id:
+                        yield SubAgentTokenEvent(
+                            task_id=current_task_id,
+                            content=message_chunk.content,
+                        )
+
+    except Exception as e:
+        # Stream 중간 발생한 예상치 못한 error
+        yield ErrorEvent(
+            code="STREAM_INTERRUPTED",
+            message="응답 생성 중 오류가 발생했습니다. 일부 결과는 위에 표시되었을 수 있습니다.",
+            recoverable=True,
+        )
 
     yield DoneEvent(thread_id=thread_id)
-

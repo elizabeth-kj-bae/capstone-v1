@@ -61,8 +61,9 @@ export interface Task {
   id: string;
   description: string;
   agent: string;
-  status: 'pending' | 'in_progress' | 'completed';
+  status: 'pending' | 'in_progress' | 'completed' | 'failed';
   result?: string;
+  error_message?: string;
 }
 
 export interface TaskListCreatedEvent {
@@ -79,13 +80,22 @@ export interface TaskStartedEvent {
 export interface TaskCompletedEvent {
   type: 'task_completed';
   task_id: string;
+  status: 'completed' | 'failed';
   result_preview?: string;
+  error_message?: string;
 }
 
 export interface SubAgentTokenEvent {
   type: 'sub_agent_token';
   task_id: string;
   content: string;
+}
+
+export interface ErrorEvent {
+  type: 'error';
+  code: string;
+  message: string;
+  recoverable: boolean;
 }
 
 // 기존 StreamEvent type을 multi-agent 이벤트까지 확장
@@ -98,7 +108,8 @@ export type StreamEvent =
   | TaskListCreatedEvent
   | TaskStartedEvent
   | TaskCompletedEvent
-  | SubAgentTokenEvent;
+  | SubAgentTokenEvent
+  | ErrorEvent;
 
 /**
  * UI에서 사용할 multi-agent 메시지 type.

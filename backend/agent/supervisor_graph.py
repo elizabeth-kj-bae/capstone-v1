@@ -9,6 +9,7 @@ from langgraph.graph.message import add_messages
 from langchain_openai import ChatOpenAI  
 from langchain.agents import create_agent
 from .mcp_client import get_mcp_tools
+from schemas.error import ToolError, OrchestrationError, CapstoneError, ErrorLayer
 
 
 class SupervisorState(TypedDict):
@@ -110,10 +111,15 @@ async def build_supervisor_graph():
             "current_task_index": 0,
         }
     
-    # Task 실행 함수
+    # Task 실행 함수 -- Update 
     async def execute_task_node(state: SupervisorState) -> dict:
         """
         현재 task를 담당 sub-agent에게 위임하여 실행.
+
+        Graceful Degradation 적용 : 
+        - Tool 실패 시 task를 'failed' 상태로 표시 
+        - 다음 task로 계속 진행 (전체 실패 X)
+        - 최종 응답 생성 시 failed task 정보를 Writing agent에게 전달 
         """
         idx = state["current_task_index"]
         task = state["tasks"][idx]
@@ -126,27 +132,56 @@ async def build_supervisor_graph():
         if task["agent"] == "research":
             agent = research_agent
         elif task["agent"] == "writing":
-            # Writing agent는 이전 research 결과들을 context로 받음
             previous_results = "\n\n".join([
                 f"- {t['description']}\n  결과: {t['result']}"
-                for t in tasks if t["result"] is not None
+                for t in tasks if t.get("result") is not None and t.get("status") == "completed"
             ])
+            failed_tasks = [t for t in tasks if t.get("status") == "failed"]
+            failed_context = ""
+            if failed_tasks:
+                failed_context = "\n\n다음 task는 실패로 정보 수집 불가:\n" + "\n".join([
+                    f"- {t['description']}: {t.get('error_message', '알 수 없는 사유')}"
+                    for t in failed_tasks
+                ])
             task_context = (
-                f"이전 task의 수집 결과:\n{previous_results}\n\n"
-                f"위 정보를 바탕으로: {task['description']}"
+                f"이전 task의 수집 결과:\n{previous_results}\n{failed_context}\n\n"
+                f"위 정보(완성 정보 + 실패 정보)를 바탕으로 사용자에게 가치 있는 답변을 제공: "
+                f"{task['description']}"
             )
             agent = writing_agent
         
-        # Sub-agent 호출
+        # Sub-agent 호출 — Graceful Degradation 적용
         agent_input_message = task["description"] if task["agent"] == "research" else task_context
-        result = await agent.ainvoke(
-            {"messages": [HumanMessage(content=agent_input_message)]},
-        )
+
+        try:
+            result = await agent.ainvoke(
+                {"messages": [HumanMessage(content=agent_input_message)]},
+            )
+            # 성공 — task 완료 처리
+            result_text = result["messages"][-1].content
+            tasks[idx] = {**tasks[idx], "status": "completed", "result": result_text}
         
-        # task 완료 처리
-        result_text = result["messages"][-1].content
-        tasks[idx] = {**tasks[idx], "status": "completed", "result": result_text}
+        except ToolError as e:
+            # Tool 실패 — 본 task만 실패로 표시, 다음 task로 계속 진행
+            tasks[idx] = {
+                **tasks[idx],
+                "status": "failed",
+                "result": None,
+                "error_code": e.error.code,
+                "error_message": e.error.user_message or "도구 사용 중 오류 발생",
+            }
+            # Error 처리 핵심: 실패해도 전체 graph는 계속 진행
         
+        except Exception as e:
+            # 예상치 못한 error — orchestration error로 변환
+            tasks[idx] = {
+                **tasks[idx],
+                "status": "failed",
+                "result": None,
+                "error_code": "UNEXPECTED_ERROR",
+                "error_message": "예상치 못한 오류가 발생했습니다",
+            }
+    
         return {
             "tasks": tasks,
             "current_task_index": idx + 1,
@@ -158,15 +193,42 @@ async def build_supervisor_graph():
             return "execute"
         return "finalize"
     
-    # 최종 응답 생성
+    # 최종 응답 생성 -- Update
     async def finalize_node(state: SupervisorState) -> dict:
         """
         모든 task 완료 후 최종 응답을 사용자에게 반환.
+
+        Graceful Degradation:
+        - Writing task가 성공했다고 그 결과를 반환
+        - Writing task도 실패했다면 partial result로 fallback 응답 생성 
         """
-        # 마지막 task가 writing이라면 그 결과를 최종 응답으로 사용
         last_task = state["tasks"][-1]
-        final_response = last_task["result"]
+
+        if last_task.get("status") == "completed" and last_task.get("result"):
+            # 정상 path
+            final_response = last_task["result"]
+        else:
+            # Fallback: writing task도 실패한 경우
+            # 수집된 partial result만으로 단순 응답 생성
+            partial_results = [
+                f"- {t['description']}: {t['result']}"
+                for t in state["tasks"]
+                if t.get("status") == "completed" and t.get("result")
+            ]
+            failed_count = sum(1 for t in state["tasks"] if t.get("status") == "failed")
         
+            if partial_results:
+                final_response = (
+                    "일부 정보 수집은 성공했으나 응답 생성에 어려움이 있었습니다. "
+                    "수집된 정보를 그대로 전달합니다:\n\n" + "\n".join(partial_results) +
+                    f"\n\n(전체 {len(state['tasks'])} 작업 중 {failed_count}개 실패)"
+                )
+            else:
+                final_response = (
+                    "죄송합니다. 요청을 처리하는 중 여러 단계에서 문제가 발생했습니다. "
+                    "잠시 후 다시 시도해 주세요."
+                )
+    
         return {
             "messages": [AIMessage(content=final_response)],
         }
