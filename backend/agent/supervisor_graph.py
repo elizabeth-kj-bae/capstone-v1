@@ -36,6 +36,12 @@ class SupervisorState(TypedDict):
     tasks: list[dict]  # [{id, description, agent, status, result}, ...]
     current_task_index: int
 
+    # Validation
+    draft_response: Optional[str]        # Writing의 응답 
+    validation_result: Optional[dict]    # Validator 결정 결과
+    writing_attempts: int                # 재시도 추적 (0부터 시작)
+    validation_feedback: Optional[str]   # 재시도 시 Writing에 전달
+    validation_attempts: int             # Validator 실행 횟수 (무한 루프 방어용)
 
 
 class RoutingDecision(BaseModel):
@@ -101,6 +107,28 @@ async def build_supervisor_graph(checkpointer: BaseCheckpointSaver):
         ),
     )
 
+    # Validator Agent
+    validator_llm = quality_llm    # 품질 평가는 quality 모델 사용
+
+    class ValidationResult(BaseModel):
+        """Validator의 평가 결과."""
+        is_acceptable: bool = Field(
+            description="응답을 사용자에게 그대로 전달할 수 있는 품질인지 (True/False)"
+        )
+        score: float = Field(
+            description="0.0-1.0 점수. 0.7 이상을 acceptable의 기준으로 권장",
+            ge=0.0,
+            le=1.0,
+        )
+        reasoning: str = Field(
+            description="판단 근거를 2-3 문장으로"
+        )
+        feedback: Optional[str] = Field(
+            default=None,
+            description="재시도가 필요할 때 Writing agent에게 전달할 구체적 개선 지시. is_acceptable이 False일 때만 작성"
+        )
+
+    
     # Routing Node 
     async def routing_node(state: SupervisorState) -> dict:
         """
@@ -158,8 +186,8 @@ route와 reasoning을 응답하세요.
             "messages": [AIMessage(content=response.content)],
         }
 
-    # Routing - Routing 결정에 따른 분기 함수
-    def route_after_routing(state: SupervisorState) -> Literal["simple_response", "planning"]:
+    # Routing - 복잡도 결정에 따른 분기 함수
+    def route_by_complexity(state: SupervisorState) -> Literal["simple_response", "planning"]:
         """
         routing_node가 채운 state["route"]에 따라 처리 경로 결정.
 
@@ -167,6 +195,37 @@ route와 reasoning을 응답하세요.
         - route == "complex" → planning (multi-agent flow)
         """
         return "simple_response" if state.get("route") == "simple" else "planning"
+
+    # Validator - 검증 결과에 따른 분기 함수
+    def route_after_validation(state: SupervisorState) -> Literal["retry_writing", "finalize"]:
+        """
+        Validator 결과에 따라 다음 step 결정.
+    
+        - is_acceptable=True → finalize (응답 확정)
+        - is_acceptable=False AND writing_attempts < 2 → retry_writing (재시도)
+        - is_acceptable=False AND writing_attempts >= 2 → finalize (재시도 한계, graceful degradation)
+        """
+        validation = state.get("validation_result", {})
+        is_acceptable = validation.get("is_acceptable", True)
+        attempts = state.get("writing_attempts", 0)
+        validation_rounds = state.get("validation_attempts", 0)
+
+        MAX_WRITING_ATTEMPTS = 2   # 최초 1회 + 재시도 1회
+        MAX_VALIDATION_ROUNDS = 3  # 방어적 hard stop: 카운터가 깨져도 무한 루프 차단
+
+        if is_acceptable:
+            return "finalize"
+
+        # 방어적 안전장치: validator가 과도하게 반복되면 무조건 종료
+        if validation_rounds >= MAX_VALIDATION_ROUNDS:
+            return "finalize"
+
+        if attempts >= MAX_WRITING_ATTEMPTS:
+            # 재시도 한계 도달, graceful degradation
+            return "finalize"
+
+        # Validation 실패 + 재시도 여유 있음 → 재시도
+        return "retry_writing"
 
     # Supervisor의 Planning 함수 (fast_llm 사용)
     async def planning_node(state: SupervisorState) -> dict:
@@ -220,6 +279,14 @@ route와 reasoning을 응답하세요.
             "plan": parsed["plan"],
             "tasks": tasks,
             "current_task_index": 0,
+            # 같은 thread_id로 이어지는 다음 질문에서 이전 턴의 카운터/결과가 남지 않도록 초기화
+            # (checkpointer가 state를 턴 간에 유지하므로, 초기화하지 않으면
+            #  writing 재시도·validator 재평가가 두 번째 질문부터 동작하지 않음)
+            "writing_attempts": 0,
+            "validation_attempts": 0,
+            "validation_feedback": None,
+            "validation_result": {},
+            "draft_response": None,
         }
     
     # Research task 병렬 실행 (fan-out / fan-in)
@@ -291,27 +358,37 @@ route와 reasoning을 응답하세요.
             "current_task_index": new_index,
         }
 
-    # Task 실행 -- Writing
+    # Task 병렬 실행 -- Writing (re-update)
     async def execute_writing_task_node(state: SupervisorState) -> dict:
         """
-        Writing task 실행 (모든 research 결과를 context로).
-
-        기존 execute_task_node의 writing 처리 로직과 동일.
+        Writing task 실행. Validator feedback이 있으면 재시도.
+    
+        - draft_response state에 응답 저장 (아직 사용자에게 노출 안 함)
+        - validation_feedback이 있으면 재시도 시 context로 활용
+        - writing_attempts 카운터 증가
         """
-        idx = state["current_task_index"]
-        
-        if idx >= len(state["tasks"]):
-            # Writing task가 없는 경우
-            return {"current_task_index": idx}
-        
-        task = state["tasks"][idx]
         tasks = state["tasks"].copy()
+
+        # Writing task를 인덱스가 아닌 명시적 탐색으로 지정.
+        # 재시도 재진입 시 current_task_index가 이미 전진해 있어도 동일 writing task를 재실행.
+        writing_idx = next(
+            (i for i, t in enumerate(tasks) if t["agent"] == "writing"),
+            None,
+        )
+
+        if writing_idx is None:
+            # Writing task 자체가 없는 경우만 통과 (재시도 재진입과 명확히 구분)
+            return {"current_task_index": state["current_task_index"]}
+
+        idx = writing_idx
+        task = tasks[idx]
         tasks[idx] = {**task, "status": "in_progress"}
-        
-        # Research 결과 통합
+
+        # Research 결과 통합 (writing task 자신의 직전 거절 응답이 재투입되지 않도록 research만)
         previous_results = "\n\n".join([
             f"- {t['description']}\n  결과: {t['result']}"
-            for t in tasks if t.get("result") is not None and t.get("status") == "completed"
+            for t in tasks
+            if t["agent"] == "research" and t.get("result") is not None and t.get("status") == "completed"
         ])
         failed_tasks = [t for t in tasks if t.get("status") == "failed"]
         failed_context = ""
@@ -320,17 +397,40 @@ route와 reasoning을 응답하세요.
                 f"- {t['description']}: {t.get('error_message', '알 수 없는 사유')}"
                 for t in failed_tasks
             ])
-        task_context = (
-            f"이전 task의 수집 결과:\n{previous_results}\n{failed_context}\n\n"
-            f"위 정보(완성 정보 + 실패 정보)를 바탕으로: {task['description']}"
-        )
         
+        # 재시도 시 Validator feedback을 context에 포함 
+        feedback = state.get("validation_feedback")
+        feedback_context = ""
+        if feedback:
+            feedback_context = (
+                f"\n\n[중요] 직전 응답이 다음 이유로 재작성이 필요합니다:\n{feedback}\n"
+                f"위 피드백을 반영하여 응답을 개선하세요.\n"
+            )
+
+        task_context = (
+            f"이전 task의 수집 결과:\n{previous_results}\n{failed_context}{feedback_context}\n\n"
+            f"위 정보를 바탕으로: {task['description']}"
+        )
+    
+        # 시도 횟수는 성공/실패와 무관하게 증가시켜야 종료 안전장치가 동작 (무한 루프 방지)
+        current_attempts = state.get("writing_attempts", 0)
+
         try:
             result = await writing_agent.ainvoke(
                 {"messages": [HumanMessage(content=task_context)]},
             )
             result_text = result["messages"][-1].content
             tasks[idx] = {**tasks[idx], "status": "completed", "result": result_text}
+
+            # draft_response에 저장 (아직 사용자에게 노출 안 함)
+            return {
+                "tasks": tasks,
+                "current_task_index": idx + 1,
+                "draft_response": result_text,
+                "writing_attempts": current_attempts + 1,
+                "validation_feedback": None,  # feedback 사용 완료, 비움
+            }
+
         except Exception as e:
             tasks[idx] = {
                 **tasks[idx],
@@ -338,50 +438,130 @@ route와 reasoning을 응답하세요.
                 "result": None,
                 "error_message": "응답 생성 중 오류가 발생했습니다",
             }
-        
+
         return {
             "tasks": tasks,
             "current_task_index": idx + 1,
+            "draft_response": None,
+            "writing_attempts": current_attempts + 1,
+            "validation_feedback": None,
         }
+
+    # Validator 실행 
+    async def validator_node(state: SupervisorState) -> dict:
+        """
+        Writing agent의 응답을 검증하는 sub-agent.
     
-    # 최종 응답 생성
+        - 응답 품질을 4가지 기준으로 평가
+        - 품질 미달 시 재시도용 feedback 생성
+        """
+        user_question = ""
+        for msg in state["messages"]:
+            if hasattr(msg, "type") and msg.type == "human":
+                user_question = msg.content
+                break
+    
+        draft = state.get("draft_response", "")
+        plan = state.get("plan", "")
+        tasks = state.get("tasks", [])
+    
+        # Task 결과들 종합
+        task_summary = "\n".join([
+            f"- {t['description']} → {t.get('result', '실패')[:200] if t.get('result') else '실패'}"
+            for t in tasks if t["agent"] == "research"
+        ])
+    
+        validation_prompt = f"""\
+다음 AI 응답을 평가하세요.
+
+[사용자 질문]
+{user_question}
+
+[수립된 Plan]
+{plan}
+
+[수집된 정보 (Research 결과 요약)]
+{task_summary}
+
+[AI 응답 (검증 대상)]
+{draft}
+
+[평가 기준]
+1. Relevance: 응답이 사용자 질문에 답하는가
+2. Completeness: 수집된 정보(Research 결과)를 충분히 활용했는가
+3. Clarity: 응답이 구조적이고 명확한가
+4. Domain Appropriateness: ICT 운영 도메인의 전문성을 보이는가
+
+[판단]
+- 위 4가지 기준을 모두 충분히 만족하면 is_acceptable=True
+- 하나라도 명확히 부족하면 is_acceptable=False
+- is_acceptable=False인 경우 feedback에 구체적 개선 지시를 작성
+  (예: "X에 대한 정보가 응답에 빠져 있음. 추가 필요" 또는 "응답 구조가 모호함. 단계별로 정리 필요")
+"""
+    
+        result = await validator_llm.with_structured_output(ValidationResult).ainvoke([
+            SystemMessage(content="You are a quality validator for AI agent responses."),
+            HumanMessage(content=validation_prompt),
+        ])
+    
+        return {
+            "validation_result": {
+                "is_acceptable": result.is_acceptable,
+                "score": result.score,
+                "reasoning": result.reasoning,
+                "feedback": result.feedback,
+            },
+            "validation_feedback": result.feedback if not result.is_acceptable else None,
+            "validation_attempts": state.get("validation_attempts", 0) + 1,
+        }
+
+    # 최종 응답 생성 -- Update
     async def finalize_node(state: SupervisorState) -> dict:
         """
-        모든 task 완료 후 최종 응답을 사용자에게 반환.
+        최종 응답을 사용자에게 반환: 
+        - draft_response를 최종 응답으로 사용
+        - Validation 실패 후 한계 도달한 경우 사용자에게 한계 안내 (graceful degradation)
 
         Graceful Degradation:
-        - Writing task가 성공했다면 그 결과를 반환
+        - Writing task가 성공했다고 그 결과를 반환
         - Writing task도 실패했다면 partial result로 fallback 응답 생성 
         """
-        last_task = state["tasks"][-1]
-
-        if last_task.get("status") == "completed" and last_task.get("result"):
-            # 정상 path
-            final_response = last_task["result"]
-        else:
-            # Fallback: writing task도 실패한 경우
+        draft = state.get("draft_response")
+        validation = state.get("validation_result", {})
+        attempts = state.get("writing_attempts", 0)
+    
+        if draft is None:
+            # Writing 자체가 실패한 경우
             partial_results = [
                 f"- {t['description']}: {t['result']}"
                 for t in state["tasks"]
-                if t.get("status") == "completed" and t.get("result")
+                if t.get("status") == "completed" and t.get("result") and t["agent"] == "research"
             ]
-            failed_count = sum(1 for t in state["tasks"] if t.get("status") == "failed")
-        
             if partial_results:
                 final_response = (
                     "일부 정보 수집은 성공했으나 응답 생성에 어려움이 있었습니다. "
-                    "수집된 정보를 그대로 전달합니다:\n\n" + "\n".join(partial_results) +
-                    f"\n\n(전체 {len(state['tasks'])} 작업 중 {failed_count}개 실패)"
+                    "수집된 정보를 그대로 전달합니다:\n\n" + "\n".join(partial_results)
                 )
             else:
                 final_response = (
                     "죄송합니다. 요청을 처리하는 중 여러 단계에서 문제가 발생했습니다. "
                     "잠시 후 다시 시도해 주세요."
                 )
+        elif not validation.get("is_acceptable", True) and attempts >= 2:
+            # Validation 한계 도달 (graceful degradation)
+            final_response = (
+                draft +
+                "\n\n---\n*응답을 두 차례 작성했으나 자체 품질 기준에 완전히 도달하지 못했습니다. "
+                "필요하시면 추가 질문을 통해 더 자세한 정보를 요청해 주세요.*"
+            )
+        else:
+            # 정상 경로: validation 통과
+            final_response = draft
     
         return {
             "messages": [AIMessage(content=final_response)],
         }
+    
 
     # Graph 구성
     workflow = StateGraph(SupervisorState)
@@ -391,13 +571,14 @@ route와 reasoning을 응답하세요.
     workflow.add_node("planning", planning_node)
     workflow.add_node("execute_research", execute_all_research_tasks_node)
     workflow.add_node("execute_writing", execute_writing_task_node)
+    workflow.add_node("validator", validator_node)
     workflow.add_node("finalize", finalize_node)
     
     # Routing
     workflow.add_edge(START, "routing")
     workflow.add_conditional_edges(
         "routing",
-        route_after_routing,
+        route_by_complexity,
         {
             "simple_response": "simple_response",
             "planning": "planning",
@@ -409,7 +590,16 @@ route와 reasoning을 응답하세요.
     workflow.add_edge("planning", "execute_research")
     workflow.add_edge("execute_research", "execute_writing")
 
-    workflow.add_edge("execute_writing", "finalize")
+    # Validation
+    workflow.add_edge("execute_writing", "validator")
+    workflow.add_conditional_edges(
+        "validator",
+        route_after_validation,
+        {
+            "retry_writing": "execute_writing",
+            "finalize": "finalize",
+        }
+    )
     workflow.add_edge("finalize", END)
     
     # Checkpointer (in-memory)

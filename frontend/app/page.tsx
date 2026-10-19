@@ -74,6 +74,21 @@ export default function ChatPage() {
                 lastMsg.routeReasoning = event.reasoning;
                 break;
 
+              // Validation (Part B-2)
+              case 'validation_completed':
+                lastMsg.validation = {
+                  is_acceptable: event.is_acceptable,
+                  score: event.score,
+                  reasoning: event.reasoning,
+                  will_retry: event.will_retry,
+                };
+                break;
+
+              case 'writing_retry':
+                lastMsg.writingRetried = true;
+                lastMsg.writingRetryFeedback = event.feedback;
+                break;
+
               case 'plan_created':
                 lastMsg.plan = event.plan;
                 break;

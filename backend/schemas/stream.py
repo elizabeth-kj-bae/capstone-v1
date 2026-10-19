@@ -115,3 +115,25 @@ class RoutingDecidedEvent(BaseModel):
     type: Literal["routing_decided"] = "routing_decided"
     route: Literal["simple", "complex"]
     reasoning: str = Field(description="결정 근거")
+
+
+class ValidationStartedEvent(BaseModel):
+    """Validator가 검증 시작."""
+    type: Literal["validation_started"] = "validation_started"
+    attempt: int = Field(description="현재 Writing 시도 횟수 (1=첫 시도, 2=재시도)")
+
+
+class ValidationCompletedEvent(BaseModel):
+    """Validator의 검증 완료."""
+    type: Literal["validation_completed"] = "validation_completed"
+    is_acceptable: bool
+    score: float
+    reasoning: str
+    will_retry: bool = Field(description="재시도 예정 여부")
+
+
+class WritingRetryEvent(BaseModel):
+    """Writing 재시도 시작."""
+    type: Literal["writing_retry"] = "writing_retry"
+    attempt: int = Field(description="재시도 회차 (2)")
+    feedback: str = Field(description="이전 Validator의 feedback")

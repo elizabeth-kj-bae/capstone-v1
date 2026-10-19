@@ -23,6 +23,9 @@ from schemas.stream import (
     SubAgentToolCallEvent,
     ErrorEvent,
     RoutingDecidedEvent,
+    ValidationStartedEvent,
+    ValidationCompletedEvent,
+    WritingRetryEvent,
 )
 
 
@@ -86,6 +89,8 @@ async def convert_supervisor_events(
     """
     current_task_id = None  # 현재 활성 task
     previous_tasks = None   # 이전 state의 tasks (변화 감지용)
+    last_validation_feedback = None  # 직전 validator가 생성한 재시도 feedback
+    last_writing_attempts = 0        # 직전 execute_writing이 기록한 시도 횟수 (will_retry 계산용)
         
     try:
         async for mode, data in supervisor_stream: 
@@ -123,6 +128,28 @@ async def convert_supervisor_events(
                                 # 전체 응답을 한 번에 보냄 (단순화)
                                 yield TokenEvent(content=last_msg.content)
 
+                    elif node_name == "validator":
+                        # Validator 결과 처리 
+                        if "validation_result" in node_update:
+                            val = node_update["validation_result"]
+                            # 재시도 시 execute_writing 단계에서 사용하기 위해 보관
+                            last_validation_feedback = val.get("feedback")
+                            # validator 노드의 update에는 writing_attempts가 없으므로
+                            # 직전 execute_writing의 값을 사용 (route_after_validation과 동일 기준)
+                            attempts = node_update.get("writing_attempts", last_writing_attempts)
+                            rounds = node_update.get("validation_attempts", 0)
+                            will_retry = (
+                                not val.get("is_acceptable", True) and
+                                attempts < 2 and
+                                rounds < 3
+                            )
+                            yield ValidationCompletedEvent(
+                                is_acceptable=val.get("is_acceptable", False),
+                                score=val.get("score", 0.0),
+                                reasoning=val.get("reasoning", ""),
+                                will_retry=will_retry,
+                            )
+
                     elif node_name in ("execute_research", "execute_writing"):
                         # 모든 execute_* 노드 공통: tasks status diff로 lifecycle 이벤트 발행.
                         # agent 종류와 무관하게 동일 로직 적용 (research·writing 모두 처리).
@@ -145,6 +172,16 @@ async def convert_supervisor_events(
                                         error_message=new_t.get("error_message"),
                                     )
                             previous_tasks = new_tasks
+
+                        # writing 재시도 감지 (execute_writing 전용 부가 로직)
+                        if node_name == "execute_writing":
+                            attempts = node_update.get("writing_attempts", 0)
+                            last_writing_attempts = attempts
+                            if attempts == 2:
+                                yield WritingRetryEvent(
+                                    attempt=2,
+                                    feedback=last_validation_feedback or "",
+                                )
 
             elif mode == "messages":
                 # Sub-agent의 LLM token chunk

@@ -96,6 +96,20 @@ export interface RoutingDecidedEvent {
   reasoning: string;
 }
 
+export interface ValidationCompletedEvent {
+  type: 'validation_completed';
+  is_acceptable: boolean;
+  score: number;
+  reasoning: string;
+  will_retry: boolean;
+}
+
+export interface WritingRetryEvent {
+  type: 'writing_retry';
+  attempt: number;
+  feedback: string;
+}
+
 
 
 // 기존 StreamEvent type을 확장
@@ -110,7 +124,9 @@ export type StreamEvent =
   | TaskCompletedEvent
   | SubAgentTokenEvent
   | ErrorEvent
-  | RoutingDecidedEvent;
+  | RoutingDecidedEvent
+  | ValidationCompletedEvent
+  | WritingRetryEvent;
 
 
 // UI에서 사용할 Error 메시지 type
@@ -121,6 +137,14 @@ export interface ErrorEvent {
   recoverable: boolean;
 }
 
+
+// UISupervisorMessage에 validation 정보 추가
+export interface ValidationInfo {
+  is_acceptable: boolean;
+  score: number;
+  reasoning: string;
+  will_retry: boolean;
+}
 
 
 // UI에서 사용할 multi-agent 메시지 type 
@@ -137,5 +161,9 @@ export interface UISupervisorMessage {
   plan?: string;
   tasks: Task[];
   taskTokens: Record<string, string>;
-
+  
+  // Validation 
+  validation?: ValidationInfo;
+  writingRetried?: boolean;
+  writingRetryFeedback?: string;
 }

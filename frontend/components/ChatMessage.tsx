@@ -1,6 +1,7 @@
 import type { UISupervisorMessage } from '@/lib/types';
 import { PlanView } from './PlanView';
 import { TaskListView } from './TaskListView';
+import { ValidationView } from './ValidationView';
 
 interface Props {
   message: UISupervisorMessage;
@@ -38,6 +39,15 @@ export function ChatMessage({ message, activeTaskId }: Props) {
               />
             )}
 
+            {/* Validation 결과 표시 */}
+            {message.validation && (
+              <ValidationView 
+                validation={message.validation}
+                retried={message.writingRetried ?? false}
+                retryFeedback={message.writingRetryFeedback}
+              />
+            )}
+            
             {/* 최종 응답 token */}
             {message.content && (
               <div className="mt-3 whitespace-pre-wrap border-t pt-3">
