@@ -54,6 +54,35 @@ class RoutingDecision(BaseModel):
     )
 
 
+class TaskSpec(BaseModel):
+    """Planner가 분해한 단일 task."""
+    description: str = Field(description="task가 수행할 작업 설명")
+    agent: Literal["research", "analysis", "writing"] = Field(
+        description=(
+            '담당 sub-agent. '
+            '"research": 정보 검색, '
+            '"analysis": 수집 정보 분석/가공, '
+            '"writing": 최종 응답 작성'
+        )
+    )
+
+
+class PlanDecision(BaseModel):
+    """Supervisor의 계획 수립 결과 (structured output)."""
+    plan: str = Field(description="전체 진행 계획 (자연어 2-3문장)")
+    needs_analysis: bool = Field(
+        description=(
+            "별도 analysis 단계가 필요한지 여부. "
+            "True: 패턴 식별·비교/분류·여러 source 통합·우선순위화·근본원인 분석 등 "
+            "수집 정보에 대한 가공/추론이 필요한 경우. "
+            "False: 단순 검색·필터·나열·요약 등 수집 결과를 거의 그대로 전달하면 되는 경우."
+        )
+    )
+    tasks: list[TaskSpec] = Field(
+        description="실행할 task 목록. 순서는 research → (analysis) → writing"
+    )
+
+
 async def build_supervisor_graph(checkpointer: BaseCheckpointSaver):
     """
     Supervisor 기반 multi-agent graph 생성.
@@ -104,6 +133,24 @@ async def build_supervisor_graph(checkpointer: BaseCheckpointSaver):
             "당신은 Writing Agent입니다. "
             "Research Agent가 수집한 정보를 받아 사용자가 이해하기 쉬운 형태로 "
             "통합된 답변을 작성하세요."
+        ),
+    )
+
+    # Sub-agent 3: Analysis Agent
+    analysis_agent = create_agent(
+        model=quality_llm,
+        tools=[],
+        system_prompt=(
+            "당신은 Analysis Agent입니다. "
+            "Research Agent가 수집한 정보를 분석하는 것이 책임입니다.\n\n"
+            "다음 중 적절한 분석 활동을 수행하세요:\n"
+            "- 패턴 식별: 데이터에서 반복되는 패턴, 추세 발견\n"
+            "- 비교/분류: 정보를 카테고리로 분류하거나 비교\n"
+            "- 통합: 여러 source의 정보를 일관된 형태로 통합\n"
+            "- 우선순위화: 중요도/긴급도 기반 순위 부여\n\n"
+            "Writing Agent와 달리, 사용자에게 직접 전달할 응답이 아닌 "
+            "Writing Agent가 활용할 분석 결과를 작성하세요. "
+            "구조화된 형태(목록, 표, 카테고리)로 표현하면 좋습니다."
         ),
     )
 
@@ -196,6 +243,40 @@ route와 reasoning을 응답하세요.
         """
         return "simple_response" if state.get("route") == "simple" else "planning"
 
+    # Routing - Planning 후 분기 함수 
+    def route_after_planning(state: SupervisorState) -> Literal["execute_research", "execute_analysis", "execute_writing"]:
+        """
+        Planning 결과에 따라 첫 task 실행 경로 결정.
+        
+        - research task가 있으면 research부터
+        - research 없이 analysis만 있으면 analysis부터 (드문 경우)
+        - 둘 다 없으면 writing으로 (단순 응답의 경우, 이론적)
+        
+        실제로는 거의 항상 research → analysis → writing 순서.
+        """
+        tasks = state.get("tasks", [])
+        has_research = any(t["agent"] == "research" for t in tasks)
+        has_analysis = any(t["agent"] == "analysis" for t in tasks)
+        
+        if has_research:
+            return "execute_research"
+        if has_analysis:
+            return "execute_analysis"
+        return "execute_writing"
+
+    # Routing - Research 완료 후 분기 함수 
+    def route_after_research(state: SupervisorState) -> Literal["execute_analysis", "execute_writing"]:
+        """
+        Research 완료 후 다음 단계 결정.
+        
+        - Analysis task가 있으면 → execute_analysis
+        - 없으면 → execute_writing (기존과 동일한 흐름)
+        """
+        tasks = state.get("tasks", [])
+        has_analysis = any(t["agent"] == "analysis" for t in tasks)
+        
+        return "execute_analysis" if has_analysis else "execute_writing"
+
     # Validator - 검증 결과에 따른 분기 함수
     def route_after_validation(state: SupervisorState) -> Literal["retry_writing", "finalize"]:
         """
@@ -227,7 +308,7 @@ route와 reasoning을 응답하세요.
         # Validation 실패 + 재시도 여유 있음 → 재시도
         return "retry_writing"
 
-    # Supervisor의 Planning 함수 (fast_llm 사용)
+    # Supervisor의 Planning 함수
     async def planning_node(state: SupervisorState) -> dict:
         """
         Supervisor: 사용자 요청을 받아 plan을 수립하고 task로 분해.
@@ -235,48 +316,53 @@ route와 reasoning을 응답하세요.
         user_msg = state["messages"][-1].content
         
         planning_prompt = f"""\
-사용자 요청을 분석하여 다음 두 가지를 작성하세요.
+사용자 요청을 분석하여 진행 계획(plan), analysis 필요 여부(needs_analysis), task 목록(tasks)을 작성하세요.
 
 사용자 요청: {user_msg}
 
-1. plan: 전체 진행 계획 (자연어 2-3문장)
-2. tasks: 실행할 task 목록 (각 task는 어느 sub-agent가 담당하는지 명시)
-   - 가능한 agent: "research" (정보 검색), "writing" (응답 작성)
+[Agent 종류]
+- "research": MCP tool로 정보 검색 (운영 매뉴얼, ticket, 시스템 상태 등)
+- "analysis": 수집된 정보를 분석/가공 (패턴 식별, 비교/분류, 통합, 우선순위화, 근본원인)
+- "writing": 최종 응답을 사용자 친화적으로 작성 (항상 마지막에 1개)
 
-다음 JSON 형식으로 응답:
-{{
-  "plan": "...",
-  "tasks": [
-    {{"description": "...", "agent": "research"}},
-    {{"description": "...", "agent": "writing"}}
-  ]
-}}
+[needs_analysis 판단 기준]
+- False (analysis 불필요): 검색 결과를 필터/나열/요약해 거의 그대로 전달하면 되는 단순 요청
+  예) "critical 등급 incident ticket을 모두 검색해 목록으로 알려주세요" → research → writing
+  예) "DB 백업 절차 문서를 찾아 알려주세요" → research → writing
+- True (analysis 필요): 수집 정보에 대한 가공·추론이 필요한 요청
+  예) "최근 incident 3건의 공통 근본원인을 비교 분석해 주세요" → research → analysis → writing
+  예) "운영 매뉴얼과 과거 incident를 종합해 DB 다운 대응 가이드를 만드세요" → research → analysis → writing
+
+[Task 설계 규칙]
+- needs_analysis=False이면 tasks에 analysis를 절대 포함하지 마세요.
+- needs_analysis=True이면 research 다음, writing 이전에 analysis를 1개 배치하세요.
+- writing task는 항상 마지막에 정확히 1개.
 """
-        response = await fast_llm.ainvoke([
+        decision = await fast_llm.with_structured_output(PlanDecision).ainvoke([
             SystemMessage(content="You are a planning supervisor."),
             HumanMessage(content=planning_prompt),
         ])
-        
-        # JSON 파싱 (간단화 — production에서는 structured output 사용 권장)
-        import json
-        import re
-        json_match = re.search(r'\{.*\}', response.content, re.DOTALL)
-        parsed = json.loads(json_match.group())
-        
+
+        # needs_analysis를 권위 있는 게이트로 사용:
+        # 모델이 규칙을 어기고 analysis task를 끼워 넣어도, needs_analysis=False면 제거.
+        spec_tasks = decision.tasks
+        if not decision.needs_analysis:
+            spec_tasks = [t for t in spec_tasks if t.agent != "analysis"]
+
         # task에 id와 status 추가
         tasks = [
             {
                 "id": f"task_{i+1}",
-                "description": t["description"],
-                "agent": t["agent"],
+                "description": t.description,
+                "agent": t.agent,
                 "status": "pending",
                 "result": None,
             }
-            for i, t in enumerate(parsed["tasks"])
+            for i, t in enumerate(spec_tasks)
         ]
-        
+
         return {
-            "plan": parsed["plan"],
+            "plan": decision.plan,
             "tasks": tasks,
             "current_task_index": 0,
             # 같은 thread_id로 이어지는 다음 질문에서 이전 턴의 카운터/결과가 남지 않도록 초기화
@@ -384,11 +470,13 @@ route와 reasoning을 응답하세요.
         task = tasks[idx]
         tasks[idx] = {**task, "status": "in_progress"}
 
-        # Research 결과 통합 (writing task 자신의 직전 거절 응답이 재투입되지 않도록 research만)
+        # Research + Analysis 결과 통합
+        # (writing task 자신의 직전 거절 응답이 재투입되지 않도록 writing은 제외,
+        #  Conditional Routing에서 추가된 analysis 결과는 Writing이 활용해야 하므로 포함)
         previous_results = "\n\n".join([
             f"- {t['description']}\n  결과: {t['result']}"
             for t in tasks
-            if t["agent"] == "research" and t.get("result") is not None and t.get("status") == "completed"
+            if t["agent"] in ("research", "analysis") and t.get("result") is not None and t.get("status") == "completed"
         ])
         failed_tasks = [t for t in tasks if t.get("status") == "failed"]
         failed_context = ""
@@ -446,6 +534,76 @@ route와 reasoning을 응답하세요.
             "writing_attempts": current_attempts + 1,
             "validation_feedback": None,
         }
+
+    # Task 실행 -- Analysis
+    async def execute_analysis_tasks_node(state: SupervisorState) -> dict:
+        """
+        Analysis task들을 실행.
+        
+        - Research 결과를 context로 받음
+        - 여러 analysis task가 있으면 병렬 실행 (Research와 같은 패턴)
+        - Analysis 결과는 Writing이 활용
+        """
+        tasks = state["tasks"].copy()
+        
+        # Analysis task indices 추출
+        analysis_indices = [
+            i for i, t in enumerate(tasks) if t["agent"] == "analysis"
+        ]
+        
+        # Analysis task가 없으면 통과
+        if not analysis_indices:
+            return {"tasks": tasks}
+        
+        # Research 결과 context 준비
+        research_results = "\n\n".join([
+            f"- {t['description']}\n  결과: {t['result']}"
+            for t in tasks
+            if t["agent"] == "research"
+            and t.get("status") == "completed"
+            and t.get("result")
+        ])
+        
+        # 각 analysis task를 in_progress로 표시
+        for i in analysis_indices:
+            tasks[i] = {**tasks[i], "status": "in_progress"}
+        
+        # 병렬 실행
+        async def run_single_analysis(idx: int) -> tuple[int, dict]:
+            task = tasks[idx]
+            
+            analysis_context = (
+                f"[Research 결과]\n{research_results}\n\n"
+                f"[분석 task]\n{task['description']}\n\n"
+                f"위 Research 결과를 바탕으로 분석 task를 수행하세요."
+            )
+            
+            try:
+                result = await analysis_agent.ainvoke(
+                    {"messages": [HumanMessage(content=analysis_context)]},
+                )
+                result_text = result["messages"][-1].content
+                return idx, {
+                    **task,
+                    "status": "completed",
+                    "result": result_text,
+                }
+            except Exception as e:
+                return idx, {
+                    **task,
+                    "status": "failed",
+                    "result": None,
+                    "error_message": "분석 중 오류가 발생했습니다",
+                }
+        
+        results = await asyncio.gather(*[
+            run_single_analysis(idx) for idx in analysis_indices
+        ])
+        
+        for idx, updated_task in results:
+            tasks[idx] = updated_task
+        
+        return {"tasks": tasks}
 
     # Validator 실행 
     async def validator_node(state: SupervisorState) -> dict:
@@ -571,6 +729,7 @@ route와 reasoning을 응답하세요.
     workflow.add_node("planning", planning_node)
     workflow.add_node("execute_research", execute_all_research_tasks_node)
     workflow.add_node("execute_writing", execute_writing_task_node)
+    workflow.add_node("execute_analysis", execute_analysis_tasks_node)
     workflow.add_node("validator", validator_node)
     workflow.add_node("finalize", finalize_node)
     
@@ -586,9 +745,27 @@ route와 reasoning을 응답하세요.
     )
     workflow.add_edge("simple_response", END)  # Simple 경로는 바로 종료
 
-    # Complex
-    workflow.add_edge("planning", "execute_research")
-    workflow.add_edge("execute_research", "execute_writing")
+    # Complex 
+    workflow.add_conditional_edges(
+        "planning",
+        route_after_planning,
+        {
+            "execute_research": "execute_research",
+            "execute_analysis": "execute_analysis",
+            "execute_writing": "execute_writing",
+        },
+    )
+
+    # Research 완료 후 분기 (Conditional Routing)
+    workflow.add_conditional_edges(
+        "execute_research",
+        route_after_research,
+        {
+            "execute_analysis": "execute_analysis",
+            "execute_writing": "execute_writing",
+        },
+    )
+    workflow.add_edge("execute_analysis", "execute_writing")
 
     # Validation
     workflow.add_edge("execute_writing", "validator")

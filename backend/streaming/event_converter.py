@@ -150,9 +150,9 @@ async def convert_supervisor_events(
                                 will_retry=will_retry,
                             )
 
-                    elif node_name in ("execute_research", "execute_writing"):
+                    elif node_name in ("execute_research", "execute_analysis", "execute_writing"):
                         # 모든 execute_* 노드 공통: tasks status diff로 lifecycle 이벤트 발행.
-                        # agent 종류와 무관하게 동일 로직 적용 (research·writing 모두 처리).
+                        # agent 종류와 무관하게 동일 로직 적용 (research·analysis·writing 모두 처리).
                         if "tasks" in node_update:
                             new_tasks = node_update["tasks"]
                             for new_t, old_t in zip(new_tasks, previous_tasks or []):
