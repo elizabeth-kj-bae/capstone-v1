@@ -42,7 +42,10 @@ bash setup.sh
 | a31-cost-latency | Part A · Cost & Latency |
 | a32-stateless | Part A · Stateless Session |
 | b10-supervisor-start | Part B · Supervisor 시작점 |
-| b20-supervisor-final | Part B · Supervisor 최종(routing/validator/conditional/planning) |
+| b11-supervisor-routing | Part B · Query Routing (B-1) |
+| b12-supervisor-validator | Part B · Validator Agent (B-2) |
+| b13-supervisor-conditional | Part B · Conditional Routing (B-3) |
+| b20-supervisor-final | Part B · Dynamic Planning (B-4) · Supervisor 최종 |
 
 > `refactor/v2` 브랜치는 Part C · product-grade 리팩터링 참고본 입니다.
 
