@@ -45,7 +45,7 @@ bash setup.sh
 | b11-supervisor-routing | Part B · Query Routing (B-1) |
 | b12-supervisor-validator | Part B · Validator Agent (B-2) |
 | b13-supervisor-conditional | Part B · Conditional Routing (B-3) |
-| b20-supervisor-final | Part B · Dynamic Planning (B-4) · Supervisor 최종 |
+| b14-supervisor-dynamic | Part B · Dynamic Planning (B-4) · Supervisor 최종 |
 
 > `refactor/v2` 브랜치는 Part C · product-grade 리팩터링 참고본 입니다.
 
