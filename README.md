@@ -12,4 +12,4 @@
 - 프론트엔드: `components/TaskListView.tsx` Agent별 라벨(🔍 Research · 📊 Analysis · ✍️ Writing) — 이전 태그부터 포함되어 있음
 
 ## 이전 / 다음
-이전: `b12-supervisor-validator` · 다음: `b20-supervisor-final`
+이전: `b12-supervisor-validator` · 다음: `b14-supervisor-dynamic`
