@@ -110,6 +110,12 @@ export interface WritingRetryEvent {
   feedback: string;
 }
 
+export interface ReplanDecidedEvent {
+  type: 'replan_decided';
+  is_sufficient: boolean;
+  reasoning: string;
+  added_task_count: number;
+}
 
 
 // 기존 StreamEvent type을 확장
@@ -126,7 +132,8 @@ export type StreamEvent =
   | ErrorEvent
   | RoutingDecidedEvent
   | ValidationCompletedEvent
-  | WritingRetryEvent;
+  | WritingRetryEvent
+  | ReplanDecidedEvent;
 
 
 // UI에서 사용할 Error 메시지 type
@@ -144,6 +151,13 @@ export interface ValidationInfo {
   score: number;
   reasoning: string;
   will_retry: boolean;
+}
+
+// UISupervisorMessage에 replan 정보 추가
+export interface ReplanInfo {
+  is_sufficient: boolean;
+  reasoning: string;
+  added_task_count: number;
 }
 
 
@@ -166,4 +180,7 @@ export interface UISupervisorMessage {
   validation?: ValidationInfo;
   writingRetried?: boolean;
   writingRetryFeedback?: string;
+
+  // Dynamic Planning
+  replans: ReplanInfo[]; 
 }

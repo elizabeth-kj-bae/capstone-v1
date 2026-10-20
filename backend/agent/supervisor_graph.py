@@ -36,6 +36,10 @@ class SupervisorState(TypedDict):
     tasks: list[dict]  # [{id, description, agent, status, result}, ...]
     current_task_index: int
 
+    # Dynamic Planning
+    replan_rounds: int                   # Replan 횟수 추적
+    replan_decision: Optional[dict]      # 최근 replan 결정 정보
+
     # Validation
     draft_response: Optional[str]        # Writing의 응답 
     validation_result: Optional[dict]    # Validator 결정 결과
@@ -80,6 +84,44 @@ class PlanDecision(BaseModel):
     )
     tasks: list[TaskSpec] = Field(
         description="실행할 task 목록. 순서는 research → (analysis) → writing"
+    )
+
+
+class ReplanDecision(BaseModel):
+    """
+    Research 결과를 평가하여 추가 정보 수집이 필요한지 판단 (평가 전용).
+
+    Dynamic Planning:
+    - is_sufficient: Research 결과가 사용자 의도를 충족하는지
+    - reasoning: 판단 근거 (LangSmith trace에 기록)
+    실제 plan/tasks 갱신은 별도 replan_node가 수행한다.
+    """
+    is_sufficient: bool = Field(
+        description=(
+            "현재까지의 Research 결과가 사용자 질문에 답하기에 충분한지. "
+            "True: 추가 검색 불필요, 다음 단계 진행. "
+            "False: 추가 정보 수집이 필요"
+        )
+    )
+    reasoning: str = Field(
+        description="판단 근거를 1-2 문장으로"
+    )
+
+
+class ReplanPlanDecision(BaseModel):
+    """Replan 시 Supervisor가 갱신한 plan과 추가 research task."""
+    plan: str = Field(
+        description=(
+            "갱신된 plan (직전 plan을 보강한 형태). "
+            "이미 수집된 raw material은 재수집하지 말고, 부족한 부분만 명시적으로 보강."
+        )
+    )
+    additional_research_tasks: list[TaskSpec] = Field(
+        description=(
+            "추가로 실행할 research task 목록. "
+            "기존 task와 중복되지 않는 새 키워드/source 사용. "
+            "agent는 반드시 'research' (analysis/writing은 이후 단계에서 처리)."
+        )
     )
 
 
@@ -308,6 +350,31 @@ route와 reasoning을 응답하세요.
         # Validation 실패 + 재시도 여유 있음 → 재시도
         return "retry_writing"
 
+    # Routing - Replan 결과에 따른 분기 함수
+    def route_after_replan(state: SupervisorState) -> Literal["replan", "execute_analysis", "execute_writing"]:
+        """
+        Replan 평가 결과에 따라 다음 step 결정.
+
+        - is_sufficient=True → 다음 단계 (analysis 또는 writing)
+        - is_sufficient=False AND replan_rounds <= MAX → replan (Supervisor가 plan 재수립)
+        - 재계획 한계 도달 → 다음 단계 (graceful degradation)
+        """
+        replan = state.get("replan_decision", {})
+        is_sufficient = replan.get("is_sufficient", True)
+        rounds = state.get("replan_rounds", 0)
+
+        MAX_REPLAN_ROUNDS = 1  # 초기 + 1회 추가 = 최대 2번 research 단계
+
+        # 충분하거나 재계획 한계 도달 → 다음 단계로 (graceful degradation)
+        if is_sufficient or rounds > MAX_REPLAN_ROUNDS:
+            tasks = state.get("tasks", [])
+            has_analysis = any(t["agent"] == "analysis" for t in tasks)
+            return "execute_analysis" if has_analysis else "execute_writing"
+
+        # Plan 재수립 단계로 분기
+        return "replan"
+
+
     # Supervisor의 Planning 함수
     async def planning_node(state: SupervisorState) -> dict:
         """
@@ -367,35 +434,48 @@ route와 reasoning을 응답하세요.
             "current_task_index": 0,
             # 같은 thread_id로 이어지는 다음 질문에서 이전 턴의 카운터/결과가 남지 않도록 초기화
             # (checkpointer가 state를 턴 간에 유지하므로, 초기화하지 않으면
-            #  writing 재시도·validator 재평가가 두 번째 질문부터 동작하지 않음)
+            #  writing 재시도·validator 재평가·replan이 두 번째 질문부터 동작하지 않음)
             "writing_attempts": 0,
             "validation_attempts": 0,
             "validation_feedback": None,
             "validation_result": {},
             "draft_response": None,
+            "replan_rounds": 0,
+            "replan_decision": {},
         }
     
-    # Research task 병렬 실행 (fan-out / fan-in)
+    # Task 병렬 실행 -- Research 
     async def execute_all_research_tasks_node(state: SupervisorState) -> dict:
         """
         Research task들을 병렬 실행.
-
+    
         Cost/Latency 최적화:
         - 기존 순차 실행 → 병렬 실행
         - Research task들은 서로 독립적이므로 병렬 가능
         - Writing task는 모든 research 결과 필요하므로 별도 실행
+
+        Dynamic Planning 위한 변경 :
+        - pending 상태의 research task만 실행
+        - 이미 completed인 task는 건너뜀 (replan으로 추가된 task만 새로 실행)
         """
         tasks = state["tasks"].copy()
-        
-        # Research task들만 추출 (writing은 별도)
+    
+        # pending 상태의 research task indices만 추출
         research_indices = [
-            i for i, t in enumerate(tasks) if t["agent"] == "research"
+            i for i, t in enumerate(tasks) if t["agent"] == "research" and t.get("status") == "pending"
         ]
-        
+
+        if not research_indices:
+            # 새로 실행할 task 없음 (이미 모두 완료된 경우)
+            return {
+                "tasks": tasks,
+                "current_task_index" : state.get("current_task_index", 0) 
+            }
+    
         # 각 research task를 in_progress로 표시
         for i in research_indices:
             tasks[i] = {**tasks[i], "status": "in_progress"}
-        
+    
         # 병렬 실행
         async def run_single_task(idx: int) -> tuple[int, dict]:
             """단일 task 실행. 결과를 (index, updated_task) 형태로 반환."""
@@ -426,22 +506,238 @@ route와 reasoning을 응답하세요.
                     "error_code": "UNEXPECTED_ERROR",
                     "error_message": "예상치 못한 오류가 발생했습니다",
                 }
-        
+    
         # asyncio.gather로 병렬 실행
         results = await asyncio.gather(*[
             run_single_task(idx) for idx in research_indices
         ])
-        
+    
         # 결과 반영
         for idx, updated_task in results:
             tasks[idx] = updated_task
-        
+    
         # current_task_index를 모든 research task가 끝난 다음으로 점프
         new_index = max(research_indices) + 1 if research_indices else 0
-        
+    
         return {
             "tasks": tasks,
             "current_task_index": new_index,
+        }
+
+    # Dynamic Planning - Replan Check 
+    async def replan_check_node(state: SupervisorState) -> dict:
+        """
+        Research 결과를 평가하여 추가 task가 필요한지 판단.
+        
+        Dynamic Planning :
+        - 현재까지의 research 결과를 종합
+        - Supervisor LLM이 사용자 의도와 비교
+        - 충분/부족 결정 + 부족 시 추가 task 제안
+        """
+        user_msg = ""
+        for msg in state["messages"]:
+            if hasattr(msg, "type") and msg.type == "human":
+                user_msg = msg.content
+                break
+        
+        plan = state.get("plan", "")
+        tasks = state["tasks"].copy()
+        
+        # 완료된 research task들의 결과 종합
+        completed_research = [
+            t for t in tasks
+            if t["agent"] == "research" 
+            and t.get("status") == "completed"
+            and t.get("result")
+        ]
+        
+        research_summary = "\n\n".join([
+            f"- Task: {t['description']}\n  결과: {t['result'][:1000]}{'...' if len(t.get('result', '')) > 1000 else ''}"
+            for t in completed_research
+        ])
+
+        # 결정적 단락은 '판단 자체가 무의미한' degenerate 케이스에만 한정.
+        # research 결과의 '의미적 충분성'은 결정론으로 알 수 없으므로 LLM이 판단.
+        research_tasks = [t for t in tasks if t["agent"] == "research"]
+        failed_research = [t for t in research_tasks if t.get("status") == "failed"]
+        
+        if not research_tasks:
+            # 평가할 research task 자체가 없음 → 다음 단계로 진행
+            return {
+                "tasks": tasks,
+                "replan_rounds": state.get("replan_rounds", 0) + 1,
+                "replan_decision": {
+                    "is_sufficient": True,
+                    "reasoning": "평가할 research task가 없어 추가 검색 불필요.",
+                    "added_task_count": 0,
+                },
+            }
+
+        # 실패한 research가 있으면 LLM 판단의 신호로 제공
+        failed_research_context = ""
+        if failed_research:
+            failed_research_context = "\n\n[실패한 Research]\n" + "\n".join(
+                f"- {t['description']}: {t.get('error_message', '사유 미상')}"
+                for t in failed_research
+            )
+        
+        # 이미 실행된 task들의 description (중복 방지용)
+        existing_task_descriptions = [t["description"] for t in tasks]
+        
+        replan_prompt = f"""\
+Research 결과가 사용자 질문에 답하기에 충분한지 판단하세요.
+
+[사용자 질문]
+{user_msg}
+
+[수립된 Plan]
+{plan}
+
+[현재까지 실행된 Task]
+{chr(10).join(f"- {desc}" for desc in existing_task_descriptions)}
+
+[Research 결과 종합]
+{research_summary}{failed_research_context}
+
+[Research의 책임 — 핵심 전제]
+Research는 'raw material(원자료)'을 수집하는 단계입니다.
+사용자가 요청하는 가이드/요약/답변/보고서/분석/제안 등 **최종 산출물**은 이후 Writing/Analysis 단계가 만듭니다.
+따라서 is_sufficient는 "raw material이 충분히 모였는가"만 봅니다. 최종 산출물이 결과에 들어있는지는 판단 기준이 아닙니다.
+
+[판단 절차]
+1. 사용자 질문에서 Research가 수집해야 할 'raw material 항목'만 추출하세요.
+   (가이드/요약/답변/보고서/분석/제안 같은 합성·가공 산출물은 Research 항목에서 제외)
+2. 각 raw material 항목이 위 Research 결과로 실제로 다뤄지는지 항목별로 확인하세요.
+3. raw material 항목 중 하나라도 결과에서 다뤄지지 않으면 is_sufficient=False.
+   모든 raw material 항목이 다뤄지면 is_sufficient=True.
+
+[유의]
+- 추가 Research(replan)는 지연·비용을 유발합니다. "더 자세할 수 있다 / 사례가 더 있을 수 있다"
+  같은 한계적·미관상 사유로는 False로 판단하지 마세요. 구체적으로 요청된 raw material이 빠졌을 때만 False.
+- 답변 분량·형식 제약(예: '50자 이내')은 Research 충분성과 무관합니다. 판단에서 제외하세요.
+- "DB 다운 가이드", "incident 종합 보고서" 같은 최종 산출물 표현은 Writing이 합성할 것이므로
+  Research 항목으로 카운트하지 마세요.
+- 실패한 Research로 특정 raw material이 비었다면, 다른 키워드/source로 재시도할 가치가 있는지 고려하세요.
+
+[예시]
+- 질문 "운영 매뉴얼과 incident를 검색해 DB 다운 가이드를 만드세요" / 결과에 매뉴얼·incident 모두 존재
+  → raw material = [매뉴얼, incident] ('가이드'는 writing의 산출물이라 제외).
+    두 항목 모두 충족 → is_sufficient=True
+- 질문 "장애 사례 3건을 비교 분석해 주세요" / 결과에 장애 사례 5건 존재
+  → raw material = [장애 사례] ('비교 분석'은 analysis의 작업이라 제외).
+    충족 → is_sufficient=True
+- 질문 "DB 백업 절차와 복구 절차를 알려줘" / 결과에 백업 절차만 있고 복구 절차 없음
+  → raw material = [백업 절차, 복구 절차]. '복구 절차' 누락 → is_sufficient=False
+"""
+        
+        # replan 판단은 'research의 역할 vs writing의 산출물' 메타 추론이라 quality 모델 사용.
+        # 호출 빈도는 complex 1회/요청으로 비용 영향 제한적.
+        decision = await quality_llm.with_structured_output(ReplanDecision).ainvoke([
+            SystemMessage(content="You are a planning evaluator who decides if more research is needed."),
+            HumanMessage(content=replan_prompt),
+        ])
+        
+        # 평가 결과만 반환. plan/tasks 갱신은 replan_node에서 수행.
+        current_rounds = state.get("replan_rounds", 0)
+
+        return {
+            "replan_rounds": current_rounds + 1,
+            "replan_decision": {
+                "is_sufficient": decision.is_sufficient,
+                "reasoning": decision.reasoning,
+                "added_task_count": 0,  # replan_node가 실제로 추가하면 그쪽에서 갱신 
+            },
+        }
+
+    # Supervisor의 Re-Planning 노드 (replan_check가 insufficient로 판단 시 실행)
+    async def replan_node(state: SupervisorState) -> dict:
+        """
+        Supervisor가 plan을 재수립.
+
+        - 직전 plan + 완료된 research 결과 + insufficient 사유를 종합
+        - 갱신된 plan + 추가 research task를 생성
+        - state['plan']을 갱신하고, 새 research task를 state['tasks']에 append
+        """
+        user_msg = ""
+        for msg in state["messages"]:
+            if hasattr(msg, "type") and msg.type == "human":
+                user_msg = msg.content
+                break
+
+        previous_plan = state.get("plan", "")
+        tasks = state["tasks"].copy()
+
+        # 완료된 research 결과 요약
+        completed_research = [
+            t for t in tasks
+            if t["agent"] == "research"
+            and t.get("status") == "completed"
+            and t.get("result")
+        ]
+        research_summary = "\n\n".join([
+            f"- Task: {t['description']}\n  결과: {t['result'][:1000]}{'...' if len(t.get('result', '')) > 1000 else ''}"
+            for t in completed_research
+        ])
+
+        # 중복 방지를 위한 기존 task description
+        existing_task_descriptions = [t["description"] for t in tasks]
+
+        insufficient_reason = state.get("replan_decision", {}).get("reasoning", "")
+
+        replan_plan_prompt = f"""\
+직전 plan을 보강하여 갱신된 plan과 추가 research task를 작성하세요.
+
+[사용자 요청]
+{user_msg}
+
+[직전 Plan]
+{previous_plan}
+
+[완료된 Research 결과 요약]
+{research_summary}
+
+[기존 task description (중복 방지)]
+{chr(10).join(f"- {desc}" for desc in existing_task_descriptions)}
+
+[부족 판정 사유 (replan_check)]
+{insufficient_reason}
+
+[작성 지침]
+- 새 plan은 직전 plan을 보강한 형태로 작성하세요.
+  (이미 수집된 raw material은 다시 수집하지 말고, 부족한 부분만 명시적으로 보강)
+- additional_research_tasks에는 추가로 필요한 research task만 포함하세요.
+  (analysis/writing은 이후 단계에서 별도 처리되므로 포함 금지)
+- 각 task는 기존 task description과 중복되지 않는 새 키워드 또는 새 source를 사용하세요.
+"""
+
+        decision = await quality_llm.with_structured_output(ReplanPlanDecision).ainvoke([
+            SystemMessage(content="You are a re-planning supervisor who revises the plan based on partial research results."),
+            HumanMessage(content=replan_plan_prompt),
+        ])
+
+        # 새 research task들을 기존 task 목록 끝에 append (완료된 task는 보존)
+        new_tasks_added = []
+        for spec in decision.additional_research_tasks:
+            # 방어적 필터: research가 아닌 task는 무시
+            if spec.agent != "research":
+                continue
+            new_task = {
+                "id": f"task_{len(tasks) + len(new_tasks_added) + 1}",
+                "description": spec.description,
+                "agent": spec.agent,
+                "status": "pending",
+                "result": None,
+            }
+            tasks.append(new_task)
+            new_tasks_added.append(new_task)
+
+        return {
+            "plan": decision.plan,  # plan 갱신
+            "tasks": tasks,
+            "replan_decision": {
+                **state.get("replan_decision", {}),
+                "added_task_count": len(new_tasks_added),
+            },
         }
 
     # Task 병렬 실행 -- Writing (re-update)
@@ -728,6 +1024,8 @@ route와 reasoning을 응답하세요.
     workflow.add_node("simple_response", simple_response_node)
     workflow.add_node("planning", planning_node)
     workflow.add_node("execute_research", execute_all_research_tasks_node)
+    workflow.add_node("replan_check", replan_check_node)
+    workflow.add_node("replan", replan_node)
     workflow.add_node("execute_writing", execute_writing_task_node)
     workflow.add_node("execute_analysis", execute_analysis_tasks_node)
     workflow.add_node("validator", validator_node)
@@ -756,15 +1054,18 @@ route와 reasoning을 응답하세요.
         },
     )
 
-    # Research 완료 후 분기 (Conditional Routing)
+    # Replan Check
+    workflow.add_edge("execute_research", "replan_check")
     workflow.add_conditional_edges(
-        "execute_research",
-        route_after_research,
+        "replan_check",
+        route_after_replan,
         {
+            "replan": "replan",                       # Plan 재수립
             "execute_analysis": "execute_analysis",
             "execute_writing": "execute_writing",
-        },
+        }
     )
+    workflow.add_edge("replan", "execute_research")   # 재수립 후 추가 research 실행
     workflow.add_edge("execute_analysis", "execute_writing")
 
     # Validation

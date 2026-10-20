@@ -26,6 +26,7 @@ from schemas.stream import (
     ValidationStartedEvent,
     ValidationCompletedEvent,
     WritingRetryEvent,
+    ReplanDecidedEvent,
 )
 
 
@@ -120,6 +121,33 @@ async def convert_supervisor_events(
                             yield TaskListCreatedEvent(tasks=node_update["tasks"])
                             previous_tasks = node_update["tasks"]
                         
+                    elif node_name == "replan_check":
+                        # Replan 평가 결과만 처리 (plan/tasks 갱신은 replan 노드에서)
+                        if "replan_decision" in node_update:
+                            decision = node_update["replan_decision"]
+                            yield ReplanDecidedEvent(
+                                is_sufficient=decision.get("is_sufficient", True),
+                                reasoning=decision.get("reasoning", ""),
+                                added_task_count=decision.get("added_task_count", 0),
+                            )
+
+                    elif node_name == "replan":
+                        # Plan 재수립 결과: 갱신된 plan + 추가 task + ReplanDecidedEvent 재발행.
+                        # ReplanDecidedEvent는 직전 replan_check의 카드를 update하는 용도
+                        # (같은 reasoning으로 발행 → frontend가 같은 카드로 인식하여 added_task_count만 갱신).
+                        if "replan_decision" in node_update:
+                            decision = node_update["replan_decision"]
+                            yield ReplanDecidedEvent(
+                                is_sufficient=False,
+                                reasoning=decision.get("reasoning", ""),
+                                added_task_count=decision.get("added_task_count", 0),
+                            )
+                        if "plan" in node_update:
+                            yield PlanCreatedEvent(plan=node_update["plan"])
+                        if "tasks" in node_update:
+                            yield TaskListCreatedEvent(tasks=node_update["tasks"])
+                            previous_tasks = node_update["tasks"]
+
                     elif node_name == "finalize":
                         # 최종 응답 → 기존 token event로 흘려보냄 (단순화)
                         if "messages" in node_update:

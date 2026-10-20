@@ -137,3 +137,18 @@ class WritingRetryEvent(BaseModel):
     type: Literal["writing_retry"] = "writing_retry"
     attempt: int = Field(description="재시도 회차 (2)")
     feedback: str = Field(description="이전 Validator의 feedback")
+
+
+class ReplanDecidedEvent(BaseModel):
+    """
+    Supervisor의 재계획 결정.
+    
+    Dynamic Planning:
+    - is_sufficient: True면 정상 진행, False면 추가 task 실행
+    - added_task_count: 추가된 task 수 (0이면 추가 없음)
+    """
+    type: Literal["replan_decided"] = "replan_decided"
+    is_sufficient: bool
+    reasoning: str
+    added_task_count: int
+

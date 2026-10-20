@@ -2,6 +2,7 @@ import type { UISupervisorMessage } from '@/lib/types';
 import { PlanView } from './PlanView';
 import { TaskListView } from './TaskListView';
 import { ValidationView } from './ValidationView';
+import { ReplanView } from './ReplanView';
 
 interface Props {
   message: UISupervisorMessage;
@@ -30,6 +31,11 @@ export function ChatMessage({ message, activeTaskId }: Props) {
           /* Complex 응답: 기존 Multi-agent UI */
           <>
             {message.plan && <PlanView plan={message.plan} />}
+            
+            {/* Replan 결정 표시 */}
+            {message.replans && message.replans.length > 0 && (
+              <ReplanView replans={message.replans} />
+            )}
             
             {message.tasks.length > 0 && (
               <TaskListView
